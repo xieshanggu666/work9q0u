@@ -33,7 +33,8 @@ class GameSession(Base):
     survivors = Column(Integer, nullable=False, default=0)
     # 待决事件快照列（含一次性 token、绑定的事件与目标），落库后刷新可恢复决策；
     # 为 None 表示当前处于“每日阶段”，不允许凭空结算危机。
-    # 三类待决事件（危机/探索遭遇/押运途中事件）共用引擎的"待决事件统一管线"
+    # 四类待决事件（危机/探索遭遇/贸易途中事件/联盟援助途中事件）共用引擎的
+    # "待决事件统一管线"
     # （见 services/engine.py 的 _PENDING_SLOTS）：同构快照、幂等凭据、互斥与终局收敛
     pending_crisis = Column(JSON, nullable=True)
     # 最近一次危机结算的幂等凭据，重复/并发落败请求据此安全回放，不再二次结算
@@ -53,6 +54,18 @@ class GameSession(Base):
     # 作用与 last_expedition 相同：订单在动作完成后即被清除时，凭此仍能识别
     # 并发落败/连点的重复请求并安全回放
     last_trade = Column(JSON, nullable=True)
+    # 地堡联盟援助协议快照（含一次性 token、联盟聚落、医护负责人会签、
+    # 押运队、托管物资、在途货物、运输天数与途中事件），落库后刷新可恢复
+    # 同一协议；为 None 表示当前没有在谈/在途协议。
+    # 状态链：proposed(待外部聚落签约) → escorting(押运运输)
+    #         → delivered/failed/rejected/lapsed/cancelled
+    aid_pact = Column(MutableDict.as_mutable(JSON), nullable=True)
+    # 最近一次联盟援助动作（途中事件抉择/押运审核/交付/失败回退/撤约）的
+    # 幂等凭据，作用与 last_trade 相同
+    last_aid = Column(JSON, nullable=True)
+    # 地堡医疗危机 0-100：随在堡活跃病例累积，联盟援助成功缓解、失败激化；
+    # 越过高压阈值后在堡全员士气持续受挫
+    medical_crisis = Column(Integer, nullable=False, default=0)
     # 医疗救治中心病例簿：每名居民的病例经历 登记→治疗/隔离→康复/病亡。
     # 活跃病例驱动每日医疗结算（床位占用/物资消耗/传染扩散），终态病例作为
     # 危机后健康结算履历保留至终局。引擎以"深拷贝整体回写"（_save_cases）

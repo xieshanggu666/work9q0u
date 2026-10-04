@@ -4,15 +4,17 @@
 项目没有引入 Alembic，这里用 ADD COLUMN 做前向兼容（对已是最新结构的库为幂等无操作）：
 - pending_crisis / last_resolution / last_expedition / expedition：状态机快照列，旧行补 NULL
 - trade_order / last_trade：贸易救援订单与幂等凭据列，旧行补 NULL
+- aid_pact / last_aid：地堡联盟援助协议与幂等凭据列，旧行补 NULL
 - medical_cases：医疗救治中心病例簿列，旧行补 NULL
+- medical_crisis：地堡医疗危机表，旧行统一从 0 开始
 - reputation：对外信誉，旧行统一从初始值 50 开始
 - row_version：乐观锁版本号，旧行统一从 1 开始
 
 补列后再做一次“旧存档归一化”（reconcile_old_saves），保证历史行加载进新引擎后
-状态机可以唯一收敛。三类待决事件（危机/探索遭遇/押运途中事件）在引擎侧共用
-同一套"待决事件管线"（见 services/engine.py 的 _PENDING_SLOTS），这里的归一化
-也走同一份快照校验（_clean_pending_snapshot）：
-- 已结束档案上悬而未决的危机/探索队/贸易订单一律清除，统一收敛到 ended
+状态机可以唯一收敛。四类待决事件（危机/探索遭遇/贸易途中事件/联盟援助途中事件）
+在引擎侧共用同一套"待决事件管线"（见 services/engine.py 的 _PENDING_SLOTS），这里的
+归一化也走同一份快照校验（_clean_pending_snapshot）：
+- 已结束档案上悬而未决的危机/探索队/贸易订单/援助协议一律清除，统一收敛到 ended
 - 损坏/悬空的快照（成员全部不在档、目标居民失踪、JSON 残缺）不阻塞每日推进
 - 病例簿中结构残缺或居民已不在档的活跃病例收敛/剔除，终态履历同步校正
 - survivors 与实际存活居民数漂移时以居民表为准校正
@@ -50,6 +52,15 @@ def ensure_schema(engine):
         if "medical_cases" not in columns:
             # 医疗救治中心病例簿：旧档案从未开展救治，从空病历开始
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN medical_cases JSON"))
+        if "medical_crisis" not in columns:
+            # NOT NULL + 常量默认值：旧档案从未承受医疗危机压力，从 0 开始
+            conn.execute(
+                text("ALTER TABLE game_sessions ADD COLUMN medical_crisis INTEGER NOT NULL DEFAULT 0")
+            )
+        if "aid_pact" not in columns:
+            conn.execute(text("ALTER TABLE game_sessions ADD COLUMN aid_pact JSON"))
+        if "last_aid" not in columns:
+            conn.execute(text("ALTER TABLE game_sessions ADD COLUMN last_aid JSON"))
         if "reputation" not in columns:
             # NOT NULL + 常量默认值：旧档案从未开展贸易，信誉从初始值 50 开始
             conn.execute(
@@ -90,15 +101,18 @@ def reconcile_old_saves(engine):
         rows = conn.execute(
             text(
                 "SELECT id, status, pending_crisis, expedition, trade_order, "
-                "medical_cases, survivors "
+                "aid_pact, medical_cases, survivors "
                 "FROM game_sessions"
             )
         ).all()
         updates = []
-        for sid, status, crisis_raw, exp_raw, trade_raw, med_raw, survivors in rows:
+        for row in rows:
+            (sid, status, crisis_raw, exp_raw, trade_raw,
+             aid_raw, med_raw, survivors) = row
             old_crisis = _loads(crisis_raw)
             old_exp = _loads(exp_raw)
             old_trade = _loads(trade_raw)
+            old_aid = _loads(aid_raw)
             old_med = _loads(med_raw)
             alive_count = None
             if {"id", "alive", "session_id"} <= resident_columns:
@@ -114,17 +128,18 @@ def reconcile_old_saves(engine):
                 new_crisis, crisis_changed = _clean_pending_crisis(conn, sid, old_crisis)
                 new_exp, exp_changed = _clean_expedition(old_exp, conn, sid)
                 new_trade, trade_changed = _clean_trade_order(old_trade, conn, sid)
+                new_aid, aid_changed = _clean_aid_pact(old_aid, conn, sid)
             else:
-                # 已结束：危机/探索队/贸易订单快照一律清空，阶段统一收敛到 ended
+                # 已结束：危机/探索队/贸易订单/援助协议快照一律清空，收敛到 ended
                 new_crisis, crisis_changed = None, old_crisis is not None
                 new_exp, exp_changed = None, old_exp is not None
                 new_trade, trade_changed = None, old_trade is not None
+                new_aid, aid_changed = None, old_aid is not None
             # 病例簿归一化与档案阶段无关：活跃病例绑定的居民必须仍在档且状态一致
             new_med, med_changed = _clean_medical_cases(old_med, conn, sid)
 
-            if crisis_changed or exp_changed or trade_changed or med_changed or (
-                alive_count is not None and alive_count != survivors
-            ):
+            if (crisis_changed or exp_changed or trade_changed or aid_changed
+                    or med_changed or (alive_count is not None and alive_count != survivors)):
                 updates.append(
                     {
                         "sid": sid,
@@ -137,6 +152,9 @@ def reconcile_old_saves(engine):
                         "trade": json.dumps(new_trade, ensure_ascii=False)
                         if new_trade is not None
                         else None,
+                        "aid": json.dumps(new_aid, ensure_ascii=False)
+                        if new_aid is not None
+                        else None,
                         "medical": json.dumps(new_med, ensure_ascii=False)
                         if new_med is not None
                         else None,
@@ -148,7 +166,7 @@ def reconcile_old_saves(engine):
                 text(
                     "UPDATE game_sessions SET pending_crisis = :crisis, "
                     "expedition = :expedition, trade_order = :trade, "
-                    "medical_cases = :medical, "
+                    "aid_pact = :aid, medical_cases = :medical, "
                     "survivors = :survivors WHERE id = :sid"
                 ),
                 u,
@@ -266,6 +284,48 @@ def _clean_trade_order(order, conn, sid):
     if not escorts:
         return None, True
     cleaned = dict(order)
+    cleaned["escorts"] = escorts
+    pending, pending_changed = _clean_pending_snapshot(
+        cleaned.get("pending_incident"), escorts
+    )
+    cleaned["pending_incident"] = pending
+    return cleaned, changed or pending_changed
+
+
+# 联盟援助协议合法状态链
+_AID_STATUSES = {"proposed", "escorting", "delivered", "failed", "rejected", "lapsed", "cancelled"}
+
+
+def _clean_aid_pact(pact, conn, sid):
+    """联盟援助协议快照归一化（口径同 _clean_trade_order）。
+
+    - 结构残缺 / 非法状态：清空（无法恢复的协议）
+    - 已收敛终态（delivered/failed/rejected/lapsed/cancelled）残留：清空
+    - 押运成员夹杂悬空/重复编号：剔除；剔除后无人则整份协议清除
+    - 在途中事件绑定目标已不在队：丢弃该事件，协议本身保留，下一次推进正常运输
+    - proposed 阶段会签医护编号悬空：整份协议清除（三方签约凭据不完整）
+
+    返回 (归一化快照, 是否发生变化)。
+    """
+    if pact is None:
+        return None, False
+    if not isinstance(pact, dict):
+        return None, True
+    status = pact.get("status")
+    if status not in _AID_STATUSES:
+        return None, True
+    if status in ("delivered", "failed", "rejected", "lapsed", "cancelled"):
+        return None, True
+    raw_escorts = pact.get("escorts")
+    if not isinstance(raw_escorts, list) or not pact.get("token"):
+        return None, True
+    known = _resident_ids(conn, sid)
+    if pact.get("signer_id") not in known:
+        return None, True
+    escorts, changed = _prune_member_ids(raw_escorts, known)
+    if not escorts:
+        return None, True
+    cleaned = dict(pact)
     cleaned["escorts"] = escorts
     pending, pending_changed = _clean_pending_snapshot(
         cleaned.get("pending_incident"), escorts

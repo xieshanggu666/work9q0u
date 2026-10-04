@@ -589,3 +589,149 @@ def test_clinic_in_buildings_and_endpoint(client):
     cats = {b["category"]: b for b in rows}
     assert "clinic" in cats
     assert cats["clinic"]["name"] == "医疗救治中心"
+
+
+# ---- 地堡联盟援助协议 HTTP 端到端 ----
+
+def test_aid_board_endpoint(client):
+    """联盟公告板只读端点：返回当日援助请求与签约资质/医疗危机。"""
+    r = client.post("/api/sessions", json={"name": "aid"})
+    sid = r.json()["id"]
+    r = client.get(f"/api/sessions/{sid}/aid/board")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["day"] == 1
+    assert body["reputation"] == 50
+    assert body["medical_crisis"] == 0
+    assert body["eligible"] is False  # 初始无救治中心、无医护
+    assert len(body["requests"]) == 3
+
+
+def test_aid_propose_requires_medic_party(client):
+    """无医疗体系时发起协议：400；任命医护后三方签约成功。"""
+    r = client.post("/api/sessions", json={"name": "aid2"})
+    sid = r.json()["id"]
+    ids = [x["id"] for x in r.json()["residents"]]
+    board = client.get(f"/api/sessions/{sid}/aid/board").json()
+    req = min(board["requests"], key=lambda q: q["eta"])
+    r = client.post(f"/api/sessions/{sid}/aid/propose", json={
+        "request_id": req["id"], "signer_id": ids[0], "escort_ids": [ids[1]],
+    })
+    assert r.status_code == 400
+    # 任命医护负责人
+    client.post(f"/api/sessions/{sid}/resident/{ids[0]}/job", json={"job": "medic"})
+    r = client.post(f"/api/sessions/{sid}/aid/propose", json={
+        "request_id": req["id"], "signer_id": ids[0], "escort_ids": [ids[1]],
+    })
+    assert r.status_code == 200
+    pact = r.json()["aid_pact"]
+    assert pact["status"] == "proposed"
+    assert pact["signer_id"] == ids[0]
+    # proposed 阶段押运队员仍在堡：aid_status=proposed，away=0
+    me = next(x for x in r.json()["residents"] if x["id"] == ids[1])
+    assert me["aid_status"] == "proposed"
+    assert me["away"] == 0
+
+
+def test_aid_full_success_flow(client, monkeypatch):
+    """三方签约→外部签约通过→押运(无事件)→检疫通过→交付：状态链 HTTP 走通。"""
+    from app.services import engine as engine_mod
+
+    vals = [0.1, 0.9, 0.9, 0.1, 0.9]  # 签约通过、途中无事件、检疫通过
+
+    class ScriptedAid:
+        def random(self):
+            return vals.pop(0) if vals else 0.9
+
+        def choice(self, seq_):
+            return seq_[0]
+
+    monkeypatch.setattr(engine_mod, "_rng", lambda: ScriptedAid())
+
+    r = client.post("/api/sessions", json={"name": "aid3"})
+    sid = r.json()["id"]
+    ids = [x["id"] for x in r.json()["residents"]]
+    client.post(f"/api/sessions/{sid}/resident/{ids[0]}/job", json={"job": "medic"})
+    board = client.get(f"/api/sessions/{sid}/aid/board").json()
+    req = min(board["requests"], key=lambda q: q["eta"])  # eta=2：签约日+在途日
+    r = client.post(f"/api/sessions/{sid}/aid/propose", json={
+        "request_id": req["id"], "signer_id": ids[0], "escort_ids": [ids[1]],
+    })
+    assert r.json()["aid_pact"]["status"] == "proposed"
+
+    # 签约日：外部聚落签约通过，当日出发并走第一个在途日（无事件）
+    r = client.post(f"/api/sessions/{sid}/advance")
+    body = r.json()["session"]
+    assert body["aid_pact"]["status"] == "escorting"
+    assert body["aid_pact"]["travel_days"] == 1
+    me = next(x for x in body["residents"] if x["id"] == ids[1])
+    assert me["away"] == 1
+    assert me["aid_status"] == "escorting"
+
+    # 抵达日：检疫关卡通过 → 交付成功，信誉 +8、协议清空
+    r = client.post(f"/api/sessions/{sid}/advance")
+    body = r.json()["session"]
+    assert body["aid_pact"] is None
+    assert body["reputation"] == 58
+
+
+def test_aid_incident_http_cycle(client, monkeypatch):
+    """援助途中事件经 HTTP 挂起→结算：pending_event 带回事件，resolve 后清除。"""
+    from app.services import engine as engine_mod
+
+    vals = [0.1, 0.1, 0.9]  # 签约通过、触发途中事件
+
+    class Scripted:
+        def random(self):
+            return vals.pop(0) if vals else 0.9
+
+        def choice(self, seq_):
+            return seq_[0]
+
+    monkeypatch.setattr(engine_mod, "_rng", lambda: Scripted())
+
+    r = client.post("/api/sessions", json={"name": "aid4"})
+    sid = r.json()["id"]
+    ids = [x["id"] for x in r.json()["residents"]]
+    client.post(f"/api/sessions/{sid}/resident/{ids[0]}/job", json={"job": "medic"})
+    board = client.get(f"/api/sessions/{sid}/aid/board").json()
+    req = next(q for q in board["requests"] if q["eta"] == 2)
+    client.post(f"/api/sessions/{sid}/aid/propose", json={
+        "request_id": req["id"], "signer_id": ids[0], "escort_ids": [ids[1]],
+    })
+    r = client.post(f"/api/sessions/{sid}/advance")
+    body = r.json()
+    assert body["pending_event"] is not None
+    assert body["session"]["aid_pact"]["pending_incident"]["event"] == body["pending_event"]["event"]
+    token = body["pending_event"]["token"]
+
+    # 事件待处理期间经营动作被后端拒绝
+    assert client.post(f"/api/sessions/{sid}/build", json={"category": "med"}).status_code == 400
+
+    r = client.post(f"/api/sessions/{sid}/aid/resolve", json={
+        "choice_key": "share_rations", "token": token,
+    })
+    assert r.status_code == 200
+    assert r.json()["aid_pact"]["cargo_ratio"] == 0.8
+    assert r.json()["aid_pact"]["pending_incident"] is None
+
+
+def test_aid_cancel_http_refund(client):
+    """proposed 阶段撤约：全额退款，连点安全回放。"""
+    r = client.post("/api/sessions", json={"name": "aid5"})
+    sid = r.json()["id"]
+    ids = [x["id"] for x in r.json()["residents"]]
+    client.post(f"/api/sessions/{sid}/resident/{ids[0]}/job", json={"job": "medic"})
+    board = client.get(f"/api/sessions/{sid}/aid/board").json()
+    req = min(board["requests"], key=lambda q: q["eta"])
+    client.post(f"/api/sessions/{sid}/aid/propose", json={
+        "request_id": req["id"], "signer_id": ids[0], "escort_ids": [ids[1]],
+    })
+    token = client.get(f"/api/sessions/{sid}").json()["aid_pact"]["token"]
+    r = client.post(f"/api/sessions/{sid}/aid/cancel", json={"token": token})
+    assert r.status_code == 200
+    assert r.json()["aid_pact"] is None
+    # 连点：幂等回放 200，不二次退款
+    r2 = client.post(f"/api/sessions/{sid}/aid/cancel", json={"token": token})
+    assert r2.status_code == 200
+    assert r2.json()["aid_pact"] is None

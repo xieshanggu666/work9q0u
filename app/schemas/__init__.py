@@ -34,6 +34,8 @@ class ResidentOut(BaseModel):
     case_infectious: int = 0
     # 贸易订单角色：transporting=在途押运；reviewing=待出发押运；None=无订单
     trade_status: Optional[str] = None
+    # 联盟援助协议角色：escorting=在途援助押运；proposed=待出发押运；None=无协议
+    aid_status: Optional[str] = None
     joined_day: int
 
     class Config:
@@ -80,9 +82,13 @@ class SessionDetail(BaseModel):
     expedition: Optional[Dict[str, Any]] = None
     # 当前贸易/救援订单快照（审核中/在途），终局后清空
     trade_order: Optional[Dict[str, Any]] = None
+    # 当前地堡联盟援助协议快照（待签约/押运在途），终局后清空
+    aid_pact: Optional[Dict[str, Any]] = None
     # 医疗救治中心病例簿（登记/治疗/隔离/康复/病亡全履历）与床位概览
     medical_cases: Optional[List[Dict[str, Any]]] = None
     medical_summary: Optional[Dict[str, Any]] = None
+    # 地堡医疗危机 0-100：随病例累积，联盟援助成功缓解、失败激化
+    medical_crisis: int = 0
     # 地堡对外信誉 0-100，影响外部聚落审核/交付
     reputation: int = 50
     residents: List[ResidentOut] = []
@@ -140,6 +146,25 @@ class TradeIncidentChoice(BaseModel):
 
 class TradeCancel(BaseModel):
     """审核阶段撤单。"""
+    token: Optional[str] = None
+
+
+class AidPropose(BaseModel):
+    """签署地堡联盟援助协议：选择当日联盟援助请求、医护负责人与押运队员。"""
+    request_id: str
+    signer_id: int
+    escort_ids: List[int]
+
+
+class AidIncidentChoice(BaseModel):
+    """处理联盟援助押运途中事件。"""
+    choice_key: str
+    # 途中事件的一次性凭据，用于识别过期/重复请求
+    token: Optional[str] = None
+
+
+class AidCancel(BaseModel):
+    """签约前（proposed）撤回协议。"""
     token: Optional[str] = None
 
 

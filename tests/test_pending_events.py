@@ -14,10 +14,13 @@ from app.services.engine import (
     CRISIS_POOL,
     EXPEDITION_ENCOUNTERS,
     TRADE_INCIDENTS,
+    AID_INCIDENTS,
     TRADE_TRANSPORTING,
+    AID_ESCORTING,
     PENDING_CRISIS,
     PENDING_ENCOUNTER,
     PENDING_INCIDENT,
+    PENDING_AID_INCIDENT,
     _PENDING_SLOTS,
     FOOD,
     WATER,
@@ -56,6 +59,16 @@ def _arm_incident(eng, gs):
     return eng.advance_day()
 
 
+def _arm_aid_incident(eng, gs):
+    """签署联盟援助协议并挂起一个援助途中事件，返回事件快照。"""
+    from tests.test_aid import AidRand, aid_request
+    gs.residents[0].job = "medic"  # 医护负责人会签人
+    gs.residents[1].job = "medic"  # 编入押运队的随队医护
+    eng.rand = AidRand([0.1, 0.1])  # 签约通过、触发途中事件
+    eng.propose_aid(aid_request(eng)["id"], gs.residents[0].id, [gs.residents[1].id])
+    return eng.advance_day()
+
+
 # ---- 同构快照：三类待决事件同一结构 ----
 
 def test_snapshots_share_one_structure(db):
@@ -75,19 +88,21 @@ def test_snapshots_share_one_structure(db):
 
 
 def test_slot_registry_covers_all_kinds(db):
-    """槽位注册表完整声明三类待决事件：持久化字段、凭据列与互斥阶段。"""
-    assert set(_PENDING_SLOTS) == {PENDING_CRISIS, PENDING_ENCOUNTER, PENDING_INCIDENT}
+    """槽位注册表完整声明四类待决事件：持久化字段、凭据列与互斥阶段。"""
+    assert set(_PENDING_SLOTS) == {
+        PENDING_CRISIS, PENDING_ENCOUNTER, PENDING_INCIDENT, PENDING_AID_INCIDENT,
+    }
     fields = {s["field"] for s in _PENDING_SLOTS.values()}
     creds = {s["credential_attr"] for s in _PENDING_SLOTS.values()}
     phases = {s["phase"] for s in _PENDING_SLOTS.values()}
     assert fields == {"pending_crisis", "pending_encounter", "pending_incident"}
-    assert creds == {"last_resolution", "last_expedition", "last_trade"}
-    assert phases == {"crisis", "expedition", "trade"}
+    assert creds == {"last_resolution", "last_expedition", "last_trade", "last_aid"}
+    assert phases == {"crisis", "expedition", "trade", "aid"}
 
 
 # ---- 持久化与恢复：三类快照落库后重开档案恢复同一场抉择 ----
 
-@pytest.mark.parametrize("kind", ["crisis", "encounter", "incident"])
+@pytest.mark.parametrize("kind", ["crisis", "encounter", "incident", "aid_incident"])
 def test_pending_event_survives_reload(db, kind):
     """挂起任一类待决事件 → 提交 → 新会话重开：恢复同一快照并可完成结算。"""
     gs = make_session(db)
@@ -96,8 +111,10 @@ def test_pending_event_survives_reload(db, kind):
         snap = arm_crisis(eng, "mutiny")
     elif kind == "encounter":
         snap = _arm_encounter(eng, gs)
-    else:
+    elif kind == "incident":
         snap = _arm_incident(eng, gs)
+    else:
+        snap = _arm_aid_incident(eng, gs)
     assert snap is not None
     db.commit()
     sid, token = gs.id, snap["token"]
@@ -116,8 +133,10 @@ def test_pending_event_survives_reload(db, kind):
             eng2.resolve_crisis("mutiny", "double_ration", token=token)
         elif kind == "encounter":
             eng2.resolve_expedition_encounter("search_carefully", token=token)
-        else:
+        elif kind == "incident":
             eng2.resolve_trade_incident("pay_toll", token=token)
+        else:
+            eng2.resolve_aid_incident("share_rations", token=token)
         assert eng2.current_pending_event() == (None, None)
         assert eng2.phase == "daily"
         db2.commit()
@@ -271,7 +290,7 @@ def test_reconcile_409_is_uniform_across_kinds(db):
 # ---- 终局收敛：一次清算全部待决槽位 ----
 
 def test_finish_clears_all_pending_slots(db):
-    """终局收敛：危机/探索队/贸易订单三类快照一次性清空，阶段统一 ended。"""
+    """终局收敛：危机/探索队/贸易订单/援助协议四类快照一次性清空，阶段统一 ended。"""
     gs = make_session(db)
     eng = BunkerEngine(db, gs, rand=FixedRand())
     gs.pending_crisis = {"token": "c", "event": "mutiny", "choices": []}
@@ -283,10 +302,15 @@ def test_finish_clears_all_pending_slots(db):
         "token": "o", "status": TRADE_TRANSPORTING, "escorts": [gs.residents[1].id],
         "pending_incident": {"token": "i", "event": "ambush"},
     }
+    gs.aid_pact = {
+        "token": "p", "status": AID_ESCORTING, "escorts": [gs.residents[2].id],
+        "pending_incident": {"token": "ai", "event": "ambush"},
+    }
     eng._finish(win=True, reason="测试终局")
     assert gs.pending_crisis is None
     assert gs.expedition is None
     assert gs.trade_order is None
+    assert gs.aid_pact is None
     assert eng.current_pending_event() == (None, None)
     assert eng.phase == "ended"
 

@@ -215,6 +215,9 @@ select {
 .mo-flow { display: flex; align-items: center; gap: 12px; font-size: 13px; margin-bottom: 6px; flex-wrap: wrap; }
 .market-offer.rescue { border-left: 3px solid rgba(229,72,77,.6); }
 .market-offer.procure { border-left: 3px solid rgba(67,200,122,.6); }
+.market-offer.aid-offer { border-left: 3px solid rgba(76,194,255,.6); }
+.crisis.aid { border-top: 3px solid rgba(76,194,255,.55); }
+.chip.proposed, .chip.escorting { color: var(--info); border-color: rgba(76,194,255,.45); }
 /* ---------- 医疗救治中心 ---------- */
 .med-head { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 .med-h3 { margin: 16px 0 8px; font-size: 14px; color: var(--text); }
