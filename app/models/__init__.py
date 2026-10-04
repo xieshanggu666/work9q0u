@@ -53,6 +53,16 @@ class GameSession(Base):
     # 作用与 last_expedition 相同：订单在动作完成后即被清除时，凭此仍能识别
     # 并发落败/连点的重复请求并安全回放
     last_trade = Column(JSON, nullable=True)
+    # 地堡联盟援助协议快照（三方契约：管理者签约 → 医护负责人会签 → 外部聚落
+    # 审核 → 押运运输 → 交付/失败回退）。含一次性 token、交易对手、押运队、
+    # 医护负责人、托管医疗物资、在途货物、运输天数与途中事件；为 None 表示
+    # 当前没有在谈协议。状态链：
+    # proposed(待会签) → reviewing(待审核) → transporting(押运运输)
+    #          → delivered/failed/rejected/cancelled
+    aid_order = Column(MutableDict.as_mutable(JSON), nullable=True)
+    # 最近一次联盟援助动作（会签/途中事件抉择/收敛撤单）的幂等凭据，
+    # 作用与 last_trade 相同：协议在动作完成后即被清除时，凭此安全回放
+    last_aid = Column(JSON, nullable=True)
     # 医疗救治中心病例簿：每名居民的病例经历 登记→治疗/隔离→康复/病亡。
     # 活跃病例驱动每日医疗结算（床位占用/物资消耗/传染扩散），终态病例作为
     # 危机后健康结算履历保留至终局。引擎以"深拷贝整体回写"（_save_cases）

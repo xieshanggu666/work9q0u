@@ -59,6 +59,28 @@ TRADE_MAX_ESCORTS = 3              # 每笔订单押运队上限
 TRADE_INCIDENT_CHANCE = 0.55       # 每个在途日触发途中事件的概率
 TRADE_REP_MIN, TRADE_REP_MAX = 0, 100
 
+# 地堡联盟援助协议（三方契约：管理者签约 + 医护负责人会签 + 外部聚落审核）
+# 疫情中的外部聚落向地堡求援：管理者起草协议、冻结托管医疗物资并组建押运队，
+# 在堡医护负责人会签后方可提交；外部聚落按下一次推进掷审核（视为对方签署），
+# 通过后押运队离堡，在途可能遭遇援助途中事件，抵达后交付并回写信誉/资源/医疗危机。
+AID_PROPOSED, AID_REVIEWING, AID_TRANSPORTING = "proposed", "reviewing", "transporting"
+AID_DELIVERED, AID_FAILED = "delivered", "failed"
+AID_REJECTED, AID_CANCELLED = "rejected", "cancelled"
+AID_MAX_ESCORTS = 3               # 每支援助押运队上限
+AID_INCIDENT_CHANCE = 0.50        # 每个在途日触发援助途中事件的概率
+AID_OFFERS_PER_DAY = 2            # 联盟援助市场每日固定报价数
+AID_REVIEW_BASE = 0.55            # 外部聚落审核基础通过率
+AID_REVIEW_MEDIC_BONUS = 0.10     # 医护负责人在岗会签带来的审核通过率加成
+AID_DELIVER_BASE = 0.60           # 抵达交付基础成功率
+AID_DELIVER_MEDIC_BONUS = 0.10    # 医护负责人带来的交付成功率加成
+AID_REP_GAIN, AID_REP_PENALTY = 8, 10   # 援助成功/失败的信誉回写
+# 医疗危机回写：抵达疫区即有概率暴露（成功/失败前统一掷一次）；医护负责人
+# 全程主持防疫规程，显著压低暴露概率；暴露者扣血并强制登记为传染病例
+AID_EXPOSURE_BASE = 0.45
+AID_EXPOSURE_MEDIC_REDUCE = 0.20
+AID_EXPOSURE_MIN_CHANCE = 0.10
+AID_EXPOSURE_DAMAGE = 18.0
+
 # 医疗救治中心系统：病例状态链 登记(registered) → 治疗(treating)/隔离(isolated)
 # → 康复(recovered)/病亡(deceased)。终态病例保留在档案中作为救治履历与健康结算依据。
 MED_REGISTERED, MED_TREATING, MED_ISOLATED = "registered", "treating", "isolated"
@@ -85,6 +107,8 @@ MED_SPREAD_DAMAGE = 8.0            # 传播对被感染者造成的即时健康�
 MED_INFECTIOUS_CRISIS_EVENTS = {"sick"}
 MED_INFECTIOUS_ENCOUNTER_EVENTS = {"weather"}
 MED_INFECTIOUS_INCIDENT_EVENTS = {"duststorm"}
+# 联盟援助途中事件中具传染性的事件 key：押运队员暴露于疫区，受伤者立为传染病例
+MED_INFECTIOUS_AID_INCIDENT_EVENTS = {"plague_contact"}
 
 
 def _clamp(v, lo=0.0, hi=100.0):
@@ -114,13 +138,17 @@ PHASE_DAILY, PHASE_CRISIS, PHASE_ENDED = "daily", "crisis", "ended"
 PHASE_EXPEDITION = "expedition"
 # 贸易阶段：押运队在途且存在待处理途中事件，状态机拒绝一切经营/推进动作
 PHASE_TRADE = "trade"
+# 联盟援助阶段：援助押运队在途且存在待处理途中事件，同口径锁定状态机
+PHASE_AID = "aid"
 
 # 待决事件种类：地堡危机 / 探索遭遇 / 押运途中事件。
 # 三类挂起抉择共用同一套"统一待决事件管线"（见 _PENDING_SLOTS 与引擎内
 # "待决事件统一管线"一节）：同构快照落库恢复、同机幂等凭据回放、
 # 同一互斥状态机与终局收敛，差异仅在宿主与效果结算。
 PENDING_CRISIS, PENDING_ENCOUNTER, PENDING_INCIDENT = "crisis", "encounter", "incident"
-PENDING_KINDS = (PENDING_CRISIS, PENDING_ENCOUNTER, PENDING_INCIDENT)
+# 联盟援助押运途中事件：与贸易途中事件同构、但宿主与事件池独立（疫区暴露回写医疗危机）
+PENDING_AID_INCIDENT = "aid_incident"
+PENDING_KINDS = (PENDING_CRISIS, PENDING_ENCOUNTER, PENDING_INCIDENT, PENDING_AID_INCIDENT)
 
 
 class BunkerEngine:
@@ -266,6 +294,10 @@ class BunkerEngine:
         order = self.session.trade_order
         if order and order.get("status") == TRADE_TRANSPORTING:
             ids.update(order.get("escorts", []))
+        # 联盟援助订单：审核中/会签中押运队仍在堡，仅在途(transporting)按离堡口径
+        aid = self.session.aid_order
+        if aid and aid.get("status") == AID_TRANSPORTING:
+            ids.update(aid.get("escorts", []))
         return ids
 
     def _away_residents(self):
@@ -348,6 +380,42 @@ class BunkerEngine:
                 )
                 self._check_end(forced_verdict=pre_verdict)
                 return None
+        aid = self.session.aid_order
+        if aid and aid.get("status") in (AID_PROPOSED, AID_REVIEWING, AID_TRANSPORTING):
+            # 联盟援助协议推进：会签后审核（reviewing→transporting/rejected）或
+            # 在途运输（travel_days 累加 → 途中事件 / 抵达交付 / 失败回退）。
+            # proposed（等待医护负责人会签）不推进、不阻塞：当日正常走地堡危机
+            if pre_verdict is not None or self._end_conditions_met():
+                # 终局/全面崩溃先收敛协议，不留"僵尸协议"：
+                # 在途协议强制安全交付（回赠先入库、押运队归队、免暴露判定），
+                # 待会签/待审核协议撤单并全额退还托管医疗物资
+                if aid.get("status") == AID_TRANSPORTING:
+                    self._deliver_aid_order(
+                        self.session.aid_order, reason="终局已至，援助队返程",
+                        forced_verdict=pre_verdict, force_success=True,
+                    )
+                else:
+                    detail = self._refund_aid_escrow(aid, ratio=1.0, label="终局撤单退还")
+                    self._log(
+                        "aid", f"撤单·{aid['partner_name']}",
+                        detail or "终局已至，协议撤销", decision="终局撤单",
+                    )
+                    self._remember_credential(
+                        PENDING_AID_INCIDENT, detail or "终局已至，协议撤销",
+                        action=self._AID_ACT_CANCEL, token=aid.get("token"),
+                    )
+                    self.session.aid_order = None
+                self._check_end(forced_verdict=pre_verdict)
+                return None
+            if aid.get("status") != AID_PROPOSED:
+                incident = self._progress_aid_order(aid, pre_verdict=pre_verdict)
+                if self.session.aid_order is None:
+                    # 协议已收敛（驳回/交付/失败回退）
+                    self._check_end(forced_verdict=pre_verdict)
+                    return None
+                if incident is not None:
+                    # 援助途中事件挂起：进入 aid 阶段，替代当日地堡危机
+                    return incident
         # 终局优先：抵达目标日或全面崩溃直接结算结局，不再凭空挂起一个
         # 永远无法处理的危机（统一每日推进 → 危机处理 → 终局的流转）
         if self._check_end(forced_verdict=pre_verdict):
@@ -568,11 +636,13 @@ class BunkerEngine:
             )
 
     def _require_no_mission(self, action):
-        """离堡任务互斥：同一时间只允许一支在外探索队/一笔在谈贸易订单。"""
+        """离堡任务互斥：同一时间只允许一支在外探索队/一笔在谈订单（贸易或联盟援助）。"""
         if self.session.expedition:
             raise BunkerEngineError(f"已有探索队在外，无法同时{action}")
         if self.session.trade_order:
             raise BunkerEngineError(f"已有在谈/在途贸易订单，无法同时{action}")
+        if self.session.aid_order:
+            raise BunkerEngineError(f"已有在谈/在途联盟援助协议，无法同时{action}")
 
     def _pending_event_def(self, kind, pending):
         """取出待决快照对应的事件定义；存档损坏（事件池中不存在）时视为无法结算。"""
@@ -1711,6 +1781,560 @@ class BunkerEngine:
         return detail, False
 
 
+    # ---- 地堡联盟援助协议 ----
+    # 三方契约状态链：
+    #   proposed    管理者已签约：托管医疗物资冻结、押运队与医护负责人已指定，
+    #               等待医护负责人会签（押运队仍在堡正常生产；管理者可撤单，全额退款）
+    #     └─ reviewing 医护负责人会签：提交外部聚落，等待对方审核签署
+    #          ├─ rejected 审核驳回：全额退还托管，协议关闭
+    #          └─ transporting 审核通过：押运队离堡在途（成员按离堡口径结算）
+    #               ├─ delivered 按期抵达并交付：医疗物资入库、信誉与士气上升、
+    #               │              地堡全员获得医疗回复（医疗危机回写）
+    #               ├─ failed    途中弃货/全损/全员失联或交付失败：剩余物资回退、
+    #               │             降信誉；押运队可能暴露于疫区立为传染病例
+    #               └─ 援助途中事件挂起（aid 阶段）：抉择后继续运输或当场收敛为 failed
+    #   cancelled 管理者在会签/审核阶段主动撤单：全额退还托管
+    def aid_market(self):
+        """生成当日联盟援助报价（确定性，无副作用）。
+
+        与贸易市场同一口径：以"日期 + 序号"为种子，同日重复打开报价一致，
+        跨天自动轮换；签约时引擎重新生成当日市场并核对 offer_id。
+        每日从四个聚落中抽取两个疫区分援点：地堡托管多种医疗物资前往，
+        成功交付后对方以其出产物资回赠。
+        """
+        import random
+        rng = random.Random(f"bunker-aid-market-day-{self.session.day}")
+        partners = list(TRADE_PARTNERS)
+        rng.shuffle(partners)
+        offers = []
+        for p in partners[:AID_OFFERS_PER_DAY]:
+            others = [k for k in RESOURCE_KEYS if k != p["favor"]]
+            want_keys = rng.sample(others, 2)  # 医疗物资包：两种资源
+            escrow = {}
+            total = 0
+            for k in want_keys:
+                amount = rng.randint(12, 22)
+                escrow[k] = float(amount)
+                total += amount * TRADE_VALUE[k]
+            # 回赠按托管相对价值折算（疫区求援、联盟价上浮），含商谈浮动
+            factor = rng.uniform(1.15, 1.45)
+            reward = max(10, round(total / TRADE_VALUE[p["favor"]] * factor))
+            offers.append({
+                "id": f"a-{p['key']}-{self.session.day}",
+                "type": "aid",
+                "partner": p["key"],
+                "partner_name": p["name"],
+                "eta": p["distance"],
+                "escrow": escrow,
+                "cargo": {p["favor"]: float(reward)},
+                "hint": f"{p['name']} 疫区求援，托管医疗物资，愿以{RESOURCE_ZH[p['favor']]}联盟价回赠，押运约 {p['distance']} 天",
+            })
+        return offers
+
+    def aid_eligible(self):
+        """签署联盟援助协议的前提：已建医疗救治中心且有在堡当值医护。"""
+        return self._active_clinic() is not None and self.medic_count() > 0
+
+    def _find_aid_offer(self, offer_id):
+        return next((o for o in self.aid_market() if o["id"] == offer_id), None)
+
+    def _validate_aid_escorts(self, escort_ids):
+        """援助押运队校验：在堡存活居民，人数 1-3，不重复、无未结病例。"""
+        if not escort_ids:
+            raise BunkerEngineError("必须指定至少一名押运队员")
+        if len(set(escort_ids)) != len(escort_ids):
+            raise BunkerEngineError("同一名居民不能重复编入押运队")
+        if len(escort_ids) > AID_MAX_ESCORTS:
+            raise BunkerEngineError(f"押运队最多 {AID_MAX_ESCORTS} 人")
+        for mid in escort_ids:
+            r = next((x for x in self.session.residents if x.id == mid), None)
+            if not r or not r.alive:
+                raise BunkerEngineError("押运队员不存在或已故")
+            if r.id in self._away_resident_ids():
+                raise BunkerEngineError(f"{r.name} 已离堡，无法参加押运")
+            if self._has_active_case(r.id):
+                raise BunkerEngineError(f"{r.name} 有未结病例，无法参加押运")
+
+    def propose_aid(self, offer_id, escort_ids, medic_id):
+        """管理者起草并签署联盟援助协议：冻结托管物资、指定押运队与医护负责人。
+
+        协议进入 proposed（等待医护负责人会签）；会签前管理者可撤单，
+        托管全额退还。押运队此时仍在堡正常生产。
+        """
+        self._require_daily_phase("签署联盟援助协议")
+        self._require_no_mission("办理联盟援助协议")
+        if not self.aid_eligible():
+            raise BunkerEngineError("需先建成医疗救治中心并有一名在堡当值医护，方可签署联盟援助协议")
+        offer = self._find_aid_offer(offer_id)
+        if offer is None:
+            raise BunkerEngineError("援助报价已过期或不存在（市场每日轮换），请重新打开联盟频道")
+        self._validate_aid_escorts(escort_ids)
+        medic = next((x for x in self.session.residents if x.id == medic_id), None)
+        if not medic or not medic.alive:
+            raise BunkerEngineError("医护负责人不存在或已故")
+        if medic.job != "medic":
+            raise BunkerEngineError(f"{medic.name} 不是当值医护，无法担任医护负责人会签")
+        if medic.id in self._away_resident_ids():
+            raise BunkerEngineError(f"{medic.name} 已离堡，无法会签")
+        if medic.id in escort_ids:
+            raise BunkerEngineError("医护负责人须留堡主持防疫规程，不能编入押运队")
+        if self._has_active_case(medic.id):
+            raise BunkerEngineError(f"{medic.name} 有未结病例，无法担任医护负责人")
+        if not self._can_afford(offer["escrow"]):
+            raise BunkerEngineError("托管医疗物资不足，无法签署该协议")
+        for k, v in offer["escrow"].items():
+            self._add_resource(k, -v)
+        order = {
+            "token": uuid.uuid4().hex,
+            "offer_id": offer["id"],
+            "type": "aid",
+            "partner": offer["partner"],
+            "partner_name": offer["partner_name"],
+            "eta": offer["eta"],
+            "status": AID_PROPOSED,
+            "applied_day": self.session.day,
+            "escorts": list(escort_ids),
+            "medic_id": medic.id,
+            "medic_name": medic.name,
+            "medic_bonus": self._aid_medic_bonus_valid(medic),
+            "escrow": dict(offer["escrow"]),       # 已冻结的托管医疗物资
+            "cargo": dict(offer["cargo"]),         # 成功交付时地堡应得回赠
+            "cargo_ratio": 1.0,                    # 在途货物残存比例
+            "travel_days": 0,
+            "incidents_resolved": 0,
+            "pending_incident": None,
+        }
+        self.session.aid_order = dict(order)
+        names = "、".join(r.name for r in self._aid_escorts(order))
+        self._log(
+            "aid", f"援助协议·{offer['partner_name']}",
+            f"管理者签署协议：{names} 组成押运队，{medic.name} 拟任医护负责人，"
+            f"托管医疗物资已冻结，等待医护负责人会签。",
+            decision="管理者签约",
+        )
+        return order
+
+    def _aid_medic_bonus_valid(self, medic):
+        """该医护负责人当前是否满足加成条件（在堡、存活、当值医护、无活跃病例）。"""
+        return bool(
+            medic and medic.alive and medic.job == "medic"
+            and medic.id not in self._away_resident_ids()
+            and not self._has_active_case(medic.id)
+        )
+
+    def _current_aid_medic(self, order):
+        return next(
+            (x for x in self.session.residents if x.id == order.get("medic_id")), None
+        )
+
+    # 援助协议动作类型（档案级幂等凭据 last_aid 的 action 取值）
+    _AID_ACT_COSIGN = "cosign"
+    _AID_ACT_INCIDENT = "incident"
+    _AID_ACT_SETTLE = "settle"   # 协议收敛（交付成功 / 失败回退 / 撤单退款 / 驳回）
+    _AID_ACT_CANCEL = "cancel"
+
+    def cosign_aid(self, token=None):
+        """医护负责人会签：协议从 proposed 进入 reviewing，等待外部聚落审核。
+
+        会签要求签约时指定的医护负责人仍在岗（在堡、存活、当值医护、无活跃病例）；
+        会签是一次性动作，重复/并发请求凭档案级凭据安全回放。
+        返回 (detail, replayed)。
+        """
+        self._ensure_running()
+        replay = self._mission_credential_replay(PENDING_AID_INCIDENT, self._AID_ACT_COSIGN, token)
+        if replay[0] is not None:
+            return replay
+        self._require_daily_phase("会签联盟援助协议")
+        order = self.session.aid_order
+        if not order:
+            if token and self._read_credential(PENDING_AID_INCIDENT):
+                raise BunkerEngineConflict("联盟援助协议状态已变化，请刷新后重试")
+            raise BunkerEngineError("当前没有待会签的联盟援助协议")
+        if token is not None and order.get("token") and token != order["token"]:
+            raise BunkerEngineConflict("联盟援助协议状态已过期，请刷新后重试")
+        if order.get("status") != AID_PROPOSED:
+            raise BunkerEngineConflict("协议已会签，请勿重复提交，请刷新后重试")
+        medic = self._current_aid_medic(order)
+        if not self._aid_medic_bonus_valid(medic):
+            raise BunkerEngineError(
+                f"{order.get('medic_name')} 已不在岗（离堡/改岗/病倒），"
+                f"无法完成会签，请撤单后重新签署协议"
+            )
+        order["status"] = AID_REVIEWING
+        order["medic_bonus"] = True
+        self.session.aid_order = dict(order)
+        detail = f"医护负责人 {medic.name} 完成会签，防疫规程齐备，协议已提交{order['partner_name']}审核。"
+        self._log("aid", f"医护会签·{order['partner_name']}", detail, decision="医护会签")
+        self._remember_credential(
+            PENDING_AID_INCIDENT, detail, action=self._AID_ACT_COSIGN,
+            token=order.get("token"),
+        )
+        return detail, False
+
+    def cancel_aid(self, token=None):
+        """会签/审核阶段主动撤单：全额退还托管。进入运输后不可撤单。"""
+        self._ensure_running()
+        replay = self._mission_credential_replay(PENDING_AID_INCIDENT, self._AID_ACT_CANCEL, token)
+        if replay[0] is not None:
+            return replay
+        self._require_daily_phase("撤销联盟援助协议")
+        order = self.session.aid_order
+        if not order:
+            if token and self._read_credential(PENDING_AID_INCIDENT):
+                raise BunkerEngineConflict("联盟援助协议状态已变化，请刷新后重试")
+            raise BunkerEngineError("当前没有在谈的联盟援助协议")
+        if token is not None and order.get("token") and token != order["token"]:
+            raise BunkerEngineConflict("联盟援助协议状态已过期，请刷新后重试")
+        if order.get("status") not in (AID_PROPOSED, AID_REVIEWING):
+            raise BunkerEngineConflict("协议已进入运输阶段，无法撤销，请刷新后重试")
+        detail = self._refund_aid_escrow(order, ratio=1.0, label="撤单退还")
+        self._log("aid", f"撤单·{order['partner_name']}", detail, decision="撤销协议")
+        detail = detail or "托管医疗物资已全额退还"
+        self._remember_credential(
+            PENDING_AID_INCIDENT, detail, action=self._AID_ACT_CANCEL,
+            token=order.get("token"),
+        )
+        self.session.aid_order = None
+        return detail, False
+
+    def _refund_aid_escrow(self, order, ratio, label="退还"):
+        """按残存比例退还托管医疗物资，返回明细文本。"""
+        parts = []
+        for k, v in order.get("escrow", {}).items():
+            amt = round(v * ratio, 1)
+            if amt > 0:
+                self._add_resource(k, amt)
+                parts.append(f"{RESOURCE_ZH.get(k, k)} +{amt:g}")
+        return f"{label}：" + "、".join(parts) if parts else ""
+
+    def _aid_escorts(self, order=None):
+        """当前援助押运队的全部居民（含已阵亡，用于交付/回退结算）。"""
+        order = order or self.session.aid_order
+        if not order:
+            return []
+        ids = set(order.get("escorts", []))
+        return [r for r in self.session.residents if r.id in ids]
+
+    # -- 每日推进：审核 / 在途运输 / 抵达交付 --
+    def _progress_aid_order(self, order, pre_verdict=None):
+        """推进联盟援助协议一天。返回挂起的途中事件（或 None）。
+
+        - reviewing：审核日。终局已锁定时直接取消（全额退款）；否则掷审核
+          （外部聚落签署），通过则当日出发并立刻走第一个在途日
+        - transporting：在途日累加，途中可能挂起事件；抵达 eta 则交付/回退
+        """
+        if order.get("status") == AID_REVIEWING:
+            # 终局日不再进行审核：撤单退款后随档案收敛到 ended
+            if pre_verdict is not None:
+                detail = self._refund_aid_escrow(order, ratio=1.0, label="终局撤单退还")
+                self._log(
+                    "aid", f"撤单·{order['partner_name']}",
+                    detail or "终局已至，协议撤销", decision="终局撤单",
+                )
+                self._remember_credential(
+                    PENDING_AID_INCIDENT, detail or "终局已至，协议撤销",
+                    action=self._AID_ACT_CANCEL, token=order.get("token"),
+                )
+                self.session.aid_order = None
+                return None
+            if not self._review_aid_order(order):
+                return None  # 审核驳回：协议已关闭
+            # 审核通过：当日出发，继续走第一个在途日
+        return self._tick_aid_transport(self.session.aid_order, pre_verdict=pre_verdict)
+
+    def _review_aid_order(self, order):
+        """外部聚落审核签署：信誉越高、医护负责人在岗越容易通过。返回是否通过。"""
+        rep = self.session.reputation if self.session.reputation is not None else TRADE_INITIAL_REPUTATION
+        chance = AID_REVIEW_BASE + rep / 250.0
+        medic = self._current_aid_medic(order)
+        medic_ok = bool(order.get("medic_bonus")) and self._aid_medic_bonus_valid(medic)
+        if medic_ok:
+            chance += AID_REVIEW_MEDIC_BONUS
+        if self.rand.random() >= chance:
+            detail = self._refund_aid_escrow(order, ratio=1.0, label="全额退还")
+            self._log(
+                "aid", f"审核驳回·{order['partner_name']}",
+                (detail + "；" if detail else "") + "对方未签署本次协议，托管医疗物资已退回。",
+                decision="审核驳回",
+            )
+            self.session.aid_order = None
+            return False
+        order["status"] = AID_TRANSPORTING
+        self.session.aid_order = dict(order)
+        names = "、".join(r.name for r in self._aid_escorts(order) if r.alive)
+        self._log(
+            "aid", f"审核通过·{order['partner_name']}",
+            f"{order['partner_name']} 签署协议，{names} 押运医疗物资出发。",
+            decision="对方签署",
+        )
+        return True
+
+    def _tick_aid_transport(self, order, pre_verdict=None):
+        """在途运输一天：累计行程、判定抵达或触发援助途中事件。"""
+        alive_escorts = [r for r in self._aid_escorts(order) if r.alive]
+        if not alive_escorts:
+            self._fail_aid_order(order, "押运队全员失联", forced_verdict=pre_verdict)
+            return None
+        order["travel_days"] += 1
+        if order["travel_days"] >= order["eta"]:
+            self._deliver_aid_order(order, reason="押运队抵达疫区聚落", forced_verdict=pre_verdict)
+            return None
+        if self.rand.random() <= AID_INCIDENT_CHANCE:
+            event = self.rand.choice(AID_INCIDENTS)
+            incident = self._build_aid_incident(event, order)
+            self._write_pending(PENDING_AID_INCIDENT, incident)
+            return incident
+        self.session.aid_order = dict(order)
+        return None
+
+    def _build_aid_incident(self, event, order):
+        """构造援助途中事件快照（与危机/遭遇/贸易途中事件同一结构）。"""
+        alive_escorts = [r for r in self._aid_escorts(order) if r.alive]
+        return self._build_pending_event(event, alive_escorts)
+
+    def resolve_aid_incident(self, choice_key, token=None):
+        """结算援助押运途中的事件抉择。
+
+        效果键与贸易途中事件同构：cargo_loss / delay / reputation /
+        health/morale / abort；区别在于健康结算按援助事件池判定传染性
+        （疫区接触即立传染病例），并在交付时统一回写医疗危机。
+        返回 (detail, replayed)。
+        """
+        self._ensure_running()
+        replay = self._mission_credential_replay(
+            PENDING_AID_INCIDENT, self._AID_ACT_INCIDENT, token, choice=choice_key
+        )
+        if replay[0] is not None:
+            return replay
+        converged = self._converged_settlement_replay(
+            PENDING_AID_INCIDENT, self._AID_ACT_SETTLE, token, choice=choice_key
+        )
+        if converged[0] is not None:
+            return converged
+        order, pending = self._locate_pending_decision(PENDING_AID_INCIDENT, token)
+        event = self._pending_event_def(PENDING_AID_INCIDENT, pending)
+        choice = self._event_choice(event, choice_key)
+        effects = choice.get("effects", {})
+        target = self._bound_target(pending, choice, self._aid_escorts(order), "押运队员")
+        detail_parts = []
+        alive_escorts = [r for r in self._aid_escorts(order) if r.alive]
+        if effects.get("cargo_loss"):
+            loss = float(effects["cargo_loss"])
+            order["cargo_ratio"] = round(max(0.0, order.get("cargo_ratio", 1.0) * (1.0 - loss)), 3)
+            detail_parts.append(f"医疗物资损耗 {int(loss * 100)}%（残存 {int(order['cargo_ratio'] * 100)}%）")
+        if effects.get("delay"):
+            d = int(effects["delay"])
+            order["eta"] += d
+            detail_parts.append(f"行程延误 {d} 天")
+        if effects.get("reputation"):
+            rep = self._add_reputation(int(effects["reputation"]))
+            detail_parts.append(f"信誉 {int(effects['reputation']):+d}（现 {rep}）")
+        self._apply_stat_effects(effects, target, alive_escorts, "全体押运队员", detail_parts)
+        if effects.get("abort"):
+            detail_parts.append("弃货撤回")
+        order["casualties"] = self._sweep_casualties(
+            alive_escorts, order.get("casualties", [])
+        )
+        if "health" in effects:
+            spec = effects["health"]
+            affected = [target] if self._effect_scope(spec) == "single" else [
+                r for r in alive_escorts if r.alive
+            ]
+            self._settle_health_aftermath(
+                affected, infectious_event=event["key"] in MED_INFECTIOUS_AID_INCIDENT_EVENTS,
+                reason=f"援助途中·{event['title']}", force=True,
+            )
+        scope_zh = f"（目标：{target.name}）" if target else ""
+        detail = "，".join(detail_parts) if detail_parts else "无显著变化"
+        self._log("crisis", f"援助途中·{event['title']}", f"选择「{choice['label']}」{scope_zh}：{detail}", decision=choice["label"])
+        inc_token = pending.get("token")
+        order["pending_incident"] = None
+        order["incidents_resolved"] += 1
+        self.session.aid_order = dict(order)
+        self._remember_credential(
+            PENDING_AID_INCIDENT, detail, action=self._AID_ACT_INCIDENT,
+            token=inc_token, host_token=order.get("token"), choice=choice["key"],
+        )
+        alive_after = [r for r in self._aid_escorts(order) if r.alive]
+        settle_reason = None
+        if not alive_after:
+            settle_reason = "押运队全员失联"
+        elif order["cargo_ratio"] <= 0:
+            settle_reason = "医疗物资全部损失，押运队空车返程"
+        elif effects.get("abort"):
+            settle_reason = "押运队弃货撤回"
+        elif self._end_conditions_met():
+            self._deliver_aid_order(
+                self.session.aid_order, reason="终局已至，援助队返程", force_success=True,
+            )
+            rec = self._read_credential(PENDING_AID_INCIDENT)
+            return_detail = rec.get("detail", "") if rec else ""
+            detail = f"{detail}；协议结算：{return_detail}" if return_detail else detail
+            return detail, False
+        if settle_reason is not None:
+            return_detail, _ = self._fail_aid_order(
+                self.session.aid_order, settle_reason,
+                inc_token=inc_token, inc_choice=choice["key"],
+            )
+            detail = f"{detail}；协议回退：{return_detail}"
+            rec = self._read_credential(PENDING_AID_INCIDENT)
+            rec["detail"] = detail
+            self._write_credential(PENDING_AID_INCIDENT, rec)
+            return detail, False
+        return detail, False
+
+    def reconcile_stale_aid(self, action, token=None, choice_key=None):
+        """并发落败后核对援助动作：同一次抉择/结算则安全回放，否则 409。"""
+        if action == self._AID_ACT_INCIDENT:
+            replay = self._mission_credential_replay(
+                PENDING_AID_INCIDENT, action, token, choice=choice_key
+            )
+            if replay[0] is not None:
+                return replay
+            converged = self._converged_settlement_replay(
+                PENDING_AID_INCIDENT, self._AID_ACT_SETTLE, token, choice=choice_key
+            )
+            if converged[0] is not None:
+                return converged
+        else:
+            replay = self._mission_credential_replay(PENDING_AID_INCIDENT, action, token)
+            if replay[0] is not None:
+                return replay
+        raise BunkerEngineConflict("联盟援助协议状态已被其他请求更新，请刷新后重试")
+
+    def _aid_medic_ok(self, order):
+        """结算时刻医护负责人是否仍在岗（离堡/改岗/病倒则防疫加成失效）。"""
+        medic = self._current_aid_medic(order)
+        return bool(order.get("medic_bonus")) and self._aid_medic_bonus_valid(medic)
+
+    def _aid_exposure(self, order, alive_escorts):
+        """医疗危机回写：押运队抵达疫区后的疫病暴露判定。
+
+        每名存活押运队员按基础概率暴露；医护负责人在岗主持防疫规程则显著
+        压低概率。暴露者扣除健康并强制登记为传染病例（随队冻结，回堡后续治），
+        健康归零者当场收敛为殉职。返回暴露者名单。
+        """
+        chance = AID_EXPOSURE_BASE
+        if self._aid_medic_ok(order):
+            chance = max(AID_EXPOSURE_MIN_CHANCE, chance - AID_EXPOSURE_MEDIC_REDUCE)
+        exposed = []
+        for r in alive_escorts:
+            if not r.alive:
+                continue
+            if self.rand.random() <= chance:
+                r.health = _clamp(r.health - AID_EXPOSURE_DAMAGE)
+                r.morale = _clamp(r.morale - 4)
+                exposed.append(r)
+        if exposed:
+            order["casualties"] = self._sweep_casualties(
+                alive_escorts, order.get("casualties", [])
+            )
+            survivors = [r for r in exposed if r.alive]
+            self._settle_health_aftermath(
+                survivors, infectious_event=True,
+                reason="援助交付·疫区暴露", force=True,
+            )
+        return exposed
+
+    def _deliver_aid_order(self, order, reason, forced_verdict=None, force_success=False):
+        """抵达交付结算：先统一回写医疗危机（疫区暴露），再掷交付成败。
+
+        成功：医疗物资送达，对方回赠入库；医护负责人主持的救治行动使在堡
+        全员获得健康回复；信誉、士气上升。失败：剩余托管回退、降信誉。
+        forced_verdict 为推进开始前快照的终局裁决，优先于内部快照，
+        入库回赠不会复活当日已成立的败局（与贸易交付同一口径）。
+        """
+        verdict = forced_verdict if forced_verdict is not None else self._end_verdict()
+        # 医疗危机回写：只要真正抵达（非强制安全收敛），押运队先过疫区暴露关
+        exposed_names = []
+        if not force_success:
+            exposed = self._aid_exposure(order, [r for r in self._aid_escorts(order) if r.alive])
+            exposed_names = [r.name for r in exposed]
+        rep = self.session.reputation if self.session.reputation is not None else TRADE_INITIAL_REPUTATION
+        chance = AID_DELIVER_BASE + rep / 250.0
+        if self._aid_medic_ok(order):
+            chance += AID_DELIVER_MEDIC_BONUS
+        success = force_success or self.rand.random() < chance
+        ratio = order.get("cargo_ratio", 1.0)
+        if not success:
+            return self._fail_aid_order(
+                order, f"{reason}，但援助失败", inc_token=None, forced_verdict=verdict,
+                exposed_names=exposed_names,
+            )
+        parts = []
+        # 成功：未送达的残份物资带回；对方按实际送达比例回赠
+        if ratio < 1.0:
+            refund = self._refund_aid_escrow(order, ratio=1.0 - ratio, label="未送达的医疗物资带回")
+            if refund:
+                parts.append(refund)
+        gain_parts = []
+        for k, v in order["cargo"].items():
+            amt = round(v * ratio, 1)
+            if amt > 0:
+                self._add_resource(k, amt)
+                gain_parts.append(f"{RESOURCE_ZH.get(k, k)} +{amt:g}")
+        if gain_parts:
+            parts.append("对方回赠：" + "、".join(gain_parts))
+        # 医疗危机回写：援助行动带动全堡卫生防疫，在堡全员获得健康回复
+        for r in self._in_bunker_residents():
+            r.health = _clamp(r.health + 4)
+        rep_now = self._add_reputation(AID_REP_GAIN)
+        for r in self._in_bunker_residents():
+            r.morale = _clamp(r.morale + 10)
+        for r in self._aid_escorts(order):
+            if r.alive:
+                r.morale = _clamp(r.morale + 12)
+        medic = self._current_aid_medic(order)
+        if medic and medic.alive:
+            medic.morale = _clamp(medic.morale + 6)
+        parts.append(f"信誉 +{AID_REP_GAIN}（现 {rep_now}），在堡全员健康 +4、士气 +10")
+        if exposed_names:
+            parts.append(f"疫区暴露：{'、'.join(exposed_names)} 已立传染病例，回堡后续治")
+        detail = "；".join(parts)
+        self._log("aid", f"援助交付·{order['partner_name']}", f"{reason}。{detail}", decision="交付结算")
+        self._remember_credential(
+            PENDING_AID_INCIDENT, detail, action=self._AID_ACT_SETTLE,
+            host_token=order.get("token"),
+        )
+        self.session.aid_order = None
+        self._check_end(forced_verdict=verdict)
+        return detail, False
+
+    def _fail_aid_order(self, order, reason, inc_token=None, inc_choice=None,
+                        forced_verdict=None, exposed_names=None):
+        """失败回退：未送出的托管医疗物资退回、扣信誉、押运队士气受挫。
+
+        抵达后交付失败同样先过疫区暴露关（exposed_names 由交付结算透传）。
+        inc_token 非空表示本次回退由某条途中事件抉择直接触发（弃货/全损/
+        全员失联），回退凭据同时挂住该事件一次性 token，供连点/并发落败回放。
+        返回 (detail, False)。
+        """
+        verdict = forced_verdict if forced_verdict is not None else self._end_verdict()
+        ratio = order.get("cargo_ratio", 1.0)
+        parts = []
+        refund = self._refund_aid_escrow(order, ratio=ratio, label="未送达医疗物资带回")
+        if refund:
+            parts.append(refund)
+        rep_now = self._add_reputation(-AID_REP_PENALTY)
+        for r in self._aid_escorts(order):
+            if r.alive:
+                r.morale = _clamp(r.morale - 10)
+        dead = [r.name for r in self._aid_escorts(order) if not r.alive]
+        parts.append(f"信誉 {-AID_REP_PENALTY:+d}（现 {rep_now}），押运队员士气 -10")
+        if exposed_names:
+            parts.append(f"疫区暴露：{'、'.join(exposed_names)} 已立传染病例，回堡后续治")
+        if dead:
+            parts.append(f"殉职：{'、'.join(dead)}")
+        detail = "；".join(parts)
+        self._log("aid", f"协议失败·{order['partner_name']}", f"{reason}。{detail}", decision="失败回退")
+        self._remember_credential(
+            PENDING_AID_INCIDENT, detail, action=self._AID_ACT_SETTLE,
+            token=inc_token, host_token=order.get("token"), choice=inc_choice,
+        )
+        self.session.aid_order = None
+        self._check_end(forced_verdict=verdict)
+        return detail, False
+
     # ---- 医疗救治中心 ----
     # 病例状态链：
     #   registered 登记：病例已建档但尚未收治（无床位/未安排），健康持续恶化；
@@ -2655,9 +3279,81 @@ TRADE_INCIDENTS = [
 ]
 
 
+# ============ 联盟援助押运途中事件池 ============
+# 援助押运队（reviewing 通过后离堡）在每个在途日可能遭遇；事件挂起时进入 aid
+# 阶段，替代当日地堡危机。效果键与贸易途中事件同构（cargo_loss/delay/reputation/
+# health/morale/abort）；差异在于事件多与疫区相关，具传染性的健康效果会把
+# 押运队员立为传染病例（医疗危机回写，回堡后续治）。
+AID_INCIDENTS = [
+    {
+        "key": "plague_contact",
+        "title": "疫区病患接触",
+        "desc": "押运队途经一处临时隔离点，濒死的病患死死抓住车厢恳求救治。",
+        "choices": [
+            {
+                "key": "sterile_aid",
+                "label": "按防疫规程施救",
+                "hint": "穿戴防护、消耗体力施救，可能有人轻微暴露，信誉在联盟内传开",
+                "effects": {"health": {"value": -6, "target": "single"}, "reputation": 5, "morale": 3},
+            },
+            {
+                "key": "drop_supplies",
+                "label": "抛下部分物资后撤离",
+                "hint": "留下两成医疗物资换取安全距离，无人暴露",
+                "effects": {"cargo_loss": 0.2, "morale": -3},
+            },
+            {
+                "key": "abandon",
+                "label": "封闭车厢弃货撤回",
+                "hint": "放弃协议保命，剩余物资随车退回，协议判失败",
+                "effects": {"abort": True, "cargo_loss": 0.0, "morale": -6},
+            },
+        ],
+    },
+    {
+        "key": "ambush",
+        "title": "流民截道",
+        "desc": "一伙武装流民在隘口设下路障，盯上了车上的医疗物资。",
+        "choices": [
+            {
+                "key": "fight_through",
+                "label": "强行突围",
+                "hint": "可能有人受伤、损失部分物资，但保住大部分协议",
+                "effects": {"health": {"value": -14, "target": "single"}, "cargo_loss": 0.2, "morale": -4},
+            },
+            {
+                "key": "pay_toll",
+                "label": "缴纳物资买路",
+                "hint": "折损三成物资，无人受伤",
+                "effects": {"cargo_loss": 0.3, "morale": -3},
+            },
+        ],
+    },
+    {
+        "key": "checkpoint",
+        "title": "联盟检疫关卡",
+        "desc": "联盟边界的检疫关卡持枪拦下押运车，要求核验医疗物资清单与防疫资质。",
+        "choices": [
+            {
+                "key": "credentials",
+                "label": "出示医护会签文书",
+                "hint": "顺利放行，规范防疫的口碑在各聚落间传开",
+                "effects": {"reputation": 4},
+            },
+            {
+                "key": "detour",
+                "label": "绕开检疫线",
+                "hint": "行程延误，队员疲惫",
+                "effects": {"delay": 2, "morale": -5},
+            },
+        ],
+    },
+]
+
+
 # ============ 待决事件槽位注册表 ============
-# 三类挂起抉择（地堡危机/探索遭遇/押运途中事件）的统一声明：引擎的
-# "待决事件统一管线"（快照构造/落库恢复/幂等凭据/互斥状态机/终局收敛）
+# 四类挂起抉择（地堡危机/探索遭遇/贸易途中事件/联盟援助途中事件）的统一声明：
+# 引擎的"待决事件统一管线"（快照构造/落库恢复/幂等凭据/互斥状态机/终局收敛）
 # 全部按本表驱动，新增一类待决事件只需在此登记一个槽位。
 #
 #   host_attr / host_status  宿主快照列与可挂起状态（None 表示宿主即档案本身）
@@ -2703,5 +3399,17 @@ _PENDING_SLOTS = {
         "zh": "途中事件",
         "host_zh": "贸易订单",
         "host_absent_zh": "在途的贸易订单",
+    },
+    PENDING_AID_INCIDENT: {
+        "host_attr": "aid_order",
+        "host_status": AID_TRANSPORTING,
+        "field": "pending_incident",
+        "pool": AID_INCIDENTS,
+        "credential_attr": "last_aid",
+        "phase": PHASE_AID,
+        "host_token_key": "order_token",
+        "zh": "援助途中事件",
+        "host_zh": "联盟援助协议",
+        "host_absent_zh": "在途的联盟援助协议",
     },
 }

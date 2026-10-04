@@ -80,6 +80,8 @@ class SessionDetail(BaseModel):
     expedition: Optional[Dict[str, Any]] = None
     # 当前贸易/救援订单快照（审核中/在途），终局后清空
     trade_order: Optional[Dict[str, Any]] = None
+    # 当前地堡联盟援助协议快照（待会签/待审核/在途），终局后清空
+    aid_order: Optional[Dict[str, Any]] = None
     # 医疗救治中心病例簿（登记/治疗/隔离/康复/病亡全履历）与床位概览
     medical_cases: Optional[List[Dict[str, Any]]] = None
     medical_summary: Optional[Dict[str, Any]] = None
@@ -140,6 +142,25 @@ class TradeIncidentChoice(BaseModel):
 
 class TradeCancel(BaseModel):
     """审核阶段撤单。"""
+    token: Optional[str] = None
+
+
+class AidPropose(BaseModel):
+    """管理者签署联盟援助协议：选择当日援助报价、押运队员与医护负责人。"""
+    offer_id: str
+    escort_ids: List[int]
+    medic_id: int
+
+
+class AidTokenAction(BaseModel):
+    """医护会签 / 撤单 / 途中事件等凭协议 token 的动作。"""
+    token: Optional[str] = None
+
+
+class AidIncidentChoice(BaseModel):
+    """处理联盟援助押运途中事件。"""
+    choice_key: str
+    # 途中事件的一次性凭据，用于识别过期/重复请求
     token: Optional[str] = None
 
 

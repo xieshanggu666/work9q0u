@@ -215,6 +215,12 @@ select {
 .mo-flow { display: flex; align-items: center; gap: 12px; font-size: 13px; margin-bottom: 6px; flex-wrap: wrap; }
 .market-offer.rescue { border-left: 3px solid rgba(229,72,77,.6); }
 .market-offer.procure { border-left: 3px solid rgba(67,200,122,.6); }
+/* ---------- 地堡联盟援助 ---------- */
+.aid h2 { color: #7fb2ff; }
+.aid-chip { color: #7fb2ff; border-color: rgba(127,178,255,.5); }
+.market-offer.aid-offer { border-left: 3px solid rgba(127,178,255,.6); }
+.chip.proposed { color: #b58bff; border-color: rgba(181,139,255,.5); }
+.exp-member.disabled { opacity: .45; cursor: not-allowed; }
 /* ---------- 医疗救治中心 ---------- */
 .med-head { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 .med-h3 { margin: 16px 0 8px; font-size: 14px; color: var(--text); }

@@ -20,6 +20,13 @@ window.GameView = {
       showTradeDialog: false,
       tradeOffer: null,
       tradeEscorts: [],
+      // 地堡联盟援助
+      aidMarket: null,
+      aidLoading: false,
+      showAidDialog: false,
+      aidOffer: null,
+      aidEscorts: [],
+      aidMedicId: null,
       // 医疗救治中心
       medRegistering: {},
     };
@@ -252,6 +259,100 @@ window.GameView = {
         `${{food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] || k} ${Math.round(v)}`
       ).join("、");
     },
+    // ---- 地堡联盟援助协议 ----
+    aidStatusZh(st) {
+      return { proposed: "待医护会签", reviewing: "聚落审核中", transporting: "押运在途",
+               delivered: "已交付", failed: "已失败回退", rejected: "已驳回",
+               cancelled: "已撤销" }[st] || st;
+    },
+    aidMedics() {
+      // 可担任医护负责人的在堡当值医护（存活、无活跃病例、未离堡）
+      return this.s ? this.s.residents.filter(
+        r => r.alive && r.job === "medic" && !r.away && !r.case_status
+      ) : [];
+    },
+    async openAidMarket() {
+      this.error = "";
+      this.aidLoading = true;
+      try {
+        this.aidMarket = await Api.get(`/api/sessions/${this.sid}/aid/market`);
+        this.showAidDialog = true;
+      } catch (e) { this.error = e.message; }
+      finally { this.aidLoading = false; }
+    },
+    pickAidOffer(o) {
+      this.aidOffer = o;
+      this.aidEscorts = [];
+      this.aidMedicId = this.aidMedics()[0] ? this.aidMedics()[0].id : null;
+    },
+    toggleAidEscort(id) {
+      const i = this.aidEscorts.indexOf(id);
+      if (i >= 0) this.aidEscorts.splice(i, 1);
+      else {
+        if (this.aidEscorts.length >= 3) { this.error = "押运队最多 3 人"; return; }
+        if (id === this.aidMedicId) { this.error = "医护负责人须留堡主持防疫，不能押运"; return; }
+        this.aidEscorts.push(id);
+      }
+    },
+    async submitAid() {
+      this.error = "";
+      if (!this.aidOffer) { this.error = "请选择一项援助报价"; return; }
+      if (!this.aidEscorts.length) { this.error = "必须指定至少一名押运队员"; return; }
+      if (!this.aidMedicId) { this.error = "必须指定一名在堡当值医护作为医护负责人"; return; }
+      if (this.aidEscorts.includes(this.aidMedicId)) { this.error = "医护负责人不能编入押运队"; return; }
+      this.loading = true;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/aid/propose`, {
+          offer_id: this.aidOffer.id,
+          escort_ids: this.aidEscorts,
+          medic_id: this.aidMedicId,
+        });
+        this.showAidDialog = false;
+        this.aidOffer = null;
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+      finally { this.loading = false; }
+    },
+    async cosignAid() {
+      this.error = "";
+      this.loading = true;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/aid/cosign`, {
+          token: this.s.aid_order.token,
+        });
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+      finally { this.loading = false; }
+    },
+    async cancelAid() {
+      this.error = "";
+      this.loading = true;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/aid/cancel`, {
+          token: this.s.aid_order.token,
+        });
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+      finally { this.loading = false; }
+    },
+    async resolveAidIncident(c) {
+      this.error = "";
+      this.loading = true;
+      try {
+        const body = { choice_key: c.key, token: this.s.aid_order.pending_incident.token };
+        this.s = await Api.post(`/api/sessions/${this.sid}/aid/resolve`, body);
+      } catch (e) { this.error = e.message; await this.loadSession(); }
+      finally { this.loading = false; }
+    },
+    aidEscortNames() {
+      if (!this.s || !this.s.aid_order) return "";
+      return (this.s.aid_order.escorts || []).map(id => {
+        const r = this.s.residents.find(x => x.id === id);
+        return r ? r.name : "?";
+      }).join("、");
+    },
+    aidMedicName() {
+      if (!this.s || !this.s.aid_order) return "";
+      const r = this.s.residents.find(x => x.id === this.s.aid_order.medic_id);
+      return r ? r.name : (this.s.aid_order.medic_name || "?");
+    },
     // ---- 医疗救治中心 ----
     medCaseOf(rid) {
       const cases = (this.s && this.s.medical_cases) || [];
@@ -315,14 +416,21 @@ window.GameView = {
     tradePending() {
       return !!(this.s && this.s.trade_order && this.s.trade_order.pending_incident);
     },
+    aidOrder() {
+      return this.s ? this.s.aid_order : null;
+    },
+    aidPending() {
+      return !!(this.s && this.s.aid_order && this.s.aid_order.pending_incident);
+    },
     // 抉择锁：地堡危机/探索遭遇/途中事件待处理时，推进与一切经营动作统一禁用
     actionLocked() {
-      return !!(this.crisis || this.expPending || this.tradePending);
+      return !!(this.crisis || this.expPending || this.tradePending || this.aidPending);
     },
     pendingTitle() {
       if (this.crisis) return "请先处理当前危机";
       if (this.expPending) return "请先处理探索遭遇";
       if (this.tradePending) return "请先处理途中事件";
+      if (this.aidPending) return "请先处理援助途中事件";
       return "";
     },
     inBunkerAlive() {
@@ -367,7 +475,7 @@ window.GameView = {
         <div class="res-track"><div class="res-fill" :class="k" :style="{ width: resPct(k)+'%' }"></div></div>
       </div>
       <button class="btn primary advance" :disabled="loading || s.status!=='running' || actionLocked" :title="pendingTitle" @click="advance">
-        {{ crisis ? '等待危机抉择' : expPending ? '等待探索遭遇抉择' : tradePending ? '等待途中事件抉择' : loading ? '推进中…' : '推进一天' }}
+        {{ crisis ? '等待危机抉择' : expPending ? '等待探索遭遇抉择' : tradePending ? '等待途中事件抉择' : aidPending ? '等待援助途中事件抉择' : loading ? '推进中…' : '推进一天' }}
       </button>
     </section>
     <div v-if="error" class="msg err global">{{ error }}</div>
@@ -379,6 +487,7 @@ window.GameView = {
         <button :class="{ active: tab==='residents' }" @click="tab='residents'">幸存者 ({{ alive.length }})</button>
         <button :class="{ active: tab==='expedition' }" @click="tab='expedition'">探索队<template v-if="s.expedition"> ({{ expMemberCount }})</template></button>
         <button :class="{ active: tab==='trade' }" @click="tab='trade'">贸易救援<template v-if="s.trade_order"> ●</template></button>
+        <button :class="{ active: tab==='aid' }" @click="tab='aid'">联盟援助<template v-if="s.aid_order"> ●</template></button>
         <button :class="{ active: tab==='medical' }" @click="tab='medical'">医疗救治<template v-if="medActiveCount"> ({{ medActiveCount }})</template></button>
         <button :class="{ active: tab==='build' }" @click="tab='build'">设施扩建</button>
         <button :class="{ active: tab==='log' }" @click="tab='log'">大事记</button>
@@ -411,7 +520,7 @@ window.GameView = {
               <span v-if="r.case_status" class="chip med-tag" :class="r.case_status">
                 {{ r.case_infectious ? '疫' : '病' }}·{{ caseStatusZh(r.case_status) }}
               </span>
-              <span v-if="r.away" class="chip away-tag">{{ r.trade_status === 'transporting' ? '押运中' : '探索中' }}</span><span v-if="r.trade_status==='reviewing'" class="chip review-tag">待押运</span>
+              <span v-if="r.away" class="chip away-tag">{{ (r.trade_status === 'transporting' || r.trade_status === 'aid_transporting') ? '押运中' : '探索中' }}</span><span v-if="r.trade_status==='reviewing'" class="chip review-tag">待押运</span><span v-if="r.trade_status==='proposed' || r.trade_status==='aid_proposed'" class="chip review-tag">待会签</span><span v-if="r.trade_status==='aid_reviewing'" class="chip review-tag">待签约</span>
             </div>
             <div class="meter"><i>健康</i><span class="track"><span class="fill" :style="{width: r.health+'%', background:'#4caf50'}"></span></span><b>{{ fmt(r.health) }}</b></div>
             <div class="meter"><i>士气</i><span class="track"><span class="fill" :style="{width: r.morale+'%', background:'#ffb300'}"></span></span><b>{{ fmt(r.morale) }}</b></div>
@@ -437,6 +546,7 @@ window.GameView = {
             <p>派遣幸存者携带物资外出探索，途中可能遭遇事件，返程时统一结算战利品与伤亡。</p>
             <p class="dim">离堡人员暂停地堡生产，不消耗地堡口粮；探索队消耗自带物资。</p>
             <button class="btn primary" :disabled="s.status!=='running' || actionLocked" @click="openExpeditionDialog">派遣探索队</button>
+            <div v-if="s.trade_order || s.aid_order" class="dim" style="margin-top:8px">有在谈贸易订单或联盟援助协议期间无法派遣探索队</div>
           </div>
         </div>
         <!-- 有在外队伍：状态 -->
@@ -470,6 +580,7 @@ window.GameView = {
               {{ marketLoading ? '联络中…' : '联络外部聚落' }}
             </button>
             <div v-if="s.expedition" class="dim" style="margin-top:8px">探索队在外期间无法办理贸易订单</div>
+            <div v-if="s.aid_order" class="dim" style="margin-top:8px">有在谈联盟援助协议期间无法办理贸易订单</div>
           </div>
           <!-- 在谈/在途订单 -->
           <div v-else class="exp-status">
@@ -497,6 +608,55 @@ window.GameView = {
               <span class="dim" v-if="s.trade_order.status==='reviewing'">审核结果将在下一次推进时公布；撤单全额退还</span>
               <span class="dim" v-if="s.trade_order.status==='transporting' && !tradePending">押运队在途，推进一天以继续运输</span>
               <span class="dim" v-if="tradePending" style="color:var(--warn)">途中出现突发状况，请先抉择</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 地堡联盟援助 -->
+      <div v-if="tab==='aid'">
+        <div class="exp-panel">
+          <!-- 无在谈协议：打开联盟频道 -->
+          <div v-if="!s.aid_order" class="exp-empty">
+            <p>地堡联盟援助协议：疫情中的外部聚落向联盟求援。<b>管理者</b>签署协议并冻结托管医疗物资、组建押运队，
+               指定一名<b>医护负责人</b>会签后提交，由<b>外部聚落</b>审核签署，押运队离堡运输，抵达后交付并回写信誉、资源与医疗危机。</p>
+            <p class="dim">需建成医疗救治中心并有一名在堡当值医护；医护负责人留堡主持防疫，会签提升审核/交付成功率并压低疫区暴露风险。</p>
+            <button class="btn primary" :disabled="s.status!=='running' || actionLocked || !!s.expedition || !!s.trade_order"
+                    @click="openAidMarket">
+              {{ aidLoading ? '联络中…' : '打开联盟援助频道' }}
+            </button>
+            <div v-if="!!s.expedition || !!s.trade_order" class="dim" style="margin-top:8px">已有探索队在外或在谈贸易订单时无法办理援助协议</div>
+          </div>
+          <!-- 在谈/在途协议 -->
+          <div v-else class="exp-status">
+            <div class="exp-row">
+              <span class="k">状态</span>
+              <span class="v">
+                <span class="chip" :class="s.aid_order.status">{{ aidStatusZh(s.aid_order.status) }}</span>
+                <b style="margin-left:8px">联盟援助 · {{ s.aid_order.partner_name }}</b>
+              </span>
+            </div>
+            <div class="exp-row"><span class="k">押运队员</span><span class="v">{{ aidEscortNames() }}</span></div>
+            <div class="exp-row"><span class="k">医护负责人</span><span class="v">{{ aidMedicName() }}（留堡主持防疫）</span></div>
+            <div class="exp-row"><span class="k">托管医疗物资（已冻结）</span><span class="v">{{ fmtTradeBags(s.aid_order.escrow) }}</span></div>
+            <div class="exp-row"><span class="k">对方回赠</span><span class="v loot">{{ fmtTradeBags(s.aid_order.cargo) }}</span></div>
+            <div class="exp-row" v-if="s.aid_order.status==='transporting'">
+              <span class="k">在途进度</span>
+              <span class="v">第 {{ s.aid_order.travel_days }} / {{ s.aid_order.eta }} 天
+                · 物资残存 {{ Math.round((s.aid_order.cargo_ratio || 1) * 100) }}%</span>
+            </div>
+            <div class="exp-row" v-if="s.aid_order.incidents_resolved">
+              <span class="k">已处理途中事件</span><span class="v">{{ s.aid_order.incidents_resolved }} 次</span>
+            </div>
+            <div class="exp-actions">
+              <button v-if="s.aid_order.status==='proposed'" class="btn primary"
+                      :disabled="s.status!=='running' || actionLocked" @click="cosignAid">医护负责人会签并提交</button>
+              <button v-if="s.aid_order.status==='proposed' || s.aid_order.status==='reviewing'" class="btn danger"
+                      :disabled="s.status!=='running' || actionLocked" @click="cancelAid">撤单并退还托管</button>
+              <span class="dim" v-if="s.aid_order.status==='proposed'">会签后协议才提交外部聚落审核；撤单全额退还</span>
+              <span class="dim" v-if="s.aid_order.status==='reviewing'">聚落审核结果将在下一次推进时公布；撤单全额退还</span>
+              <span class="dim" v-if="s.aid_order.status==='transporting' && !aidPending">押运队在途，推进一天以继续运输</span>
+              <span class="dim" v-if="aidPending" style="color:var(--warn)">途中出现突发状况，请先抉择</span>
             </div>
           </div>
         </div>
@@ -681,6 +841,24 @@ window.GameView = {
       </div>
     </div>
 
+    <!-- 联盟援助途中事件弹层 -->
+    <div v-if="aidPending" class="overlay">
+      <div class="crisis aid">
+        <h2>⚕️ {{ s.aid_order.pending_incident.title }}</h2>
+        <p class="crisis-desc">{{ s.aid_order.pending_incident.desc }}</p>
+        <div v-if="s.aid_order.pending_incident.needs_target" class="crisis-tgt">
+          相关队员：{{ s.aid_order.pending_incident.target_name }}<span class="dim">（仅标注「单人」的决策作用于本人，其余对全体押运队员生效）</span>
+        </div>
+        <div class="choices">
+          <button v-for="c in s.aid_order.pending_incident.choices" :key="c.key" class="choice" @click="resolveAidIncident(c)">
+            <strong>{{ c.label }}</strong>
+            <span class="scope-tag" :class="{ solo: c.targeted }">{{ c.targeted ? '单人' : '全队' }}</span>
+            <span class="hint">{{ c.hint }}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- 贸易市场弹层 -->
     <div v-if="showTradeDialog" class="overlay">
       <div class="crisis trade market-dialog">
@@ -735,6 +913,78 @@ window.GameView = {
               <strong>{{ loading ? '提交中…' : '冻结托管并提交申请' }}</strong>
             </button>
             <button class="choice" @click="tradeOffer=null"><strong>返回报价列表</strong></button>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- 联盟援助频道弹层 -->
+    <div v-if="showAidDialog" class="overlay">
+      <div class="crisis aid market-dialog">
+        <h2>📡 地堡联盟援助频道</h2>
+        <p class="crisis-desc">第 {{ aidMarket.day }} 天的疫区求援（报价每日轮换）。当前信誉 <b>{{ aidMarket.reputation }}</b>，信誉越高、医护会签越规范，审核与交付越顺利。</p>
+        <div v-if="!aidMarket.eligible" class="msg err">需先建成「医疗救治中心」并有一名在堡当值医护，方可签署援助协议。</div>
+        <!-- 报价列表 / 押运队员+医护负责人选择 两级视图 -->
+        <template v-if="!aidOffer">
+          <div class="market-list">
+            <div v-for="o in aidMarket.offers" :key="o.id" class="market-offer aid-offer" @click="aidMarket.eligible && pickAidOffer(o)">
+              <div class="mo-head">
+                <span class="chip aid-chip">疫区求援</span>
+                <strong>{{ o.partner_name }}</strong>
+                <span class="dim">单程约 {{ o.eta }} 天</span>
+              </div>
+              <div class="mo-flow">
+                <span>托管：<b>{{ fmtTradeBags(o.escrow) }}</b></span>
+                <span>→</span>
+                <span class="loot">回赠：<b>{{ fmtTradeBags(o.cargo) }}</b></span>
+              </div>
+              <div class="dim">{{ o.hint }}</div>
+            </div>
+          </div>
+          <div class="choices">
+            <button class="choice" @click="showAidDialog=false"><strong>关闭</strong></button>
+          </div>
+        </template>
+        <template v-else>
+          <div class="market-offer aid-offer">
+            <div class="mo-head">
+              <span class="chip aid-chip">疫区求援</span>
+              <strong>{{ aidOffer.partner_name }}</strong>
+              <span class="dim">单程约 {{ aidOffer.eta }} 天</span>
+            </div>
+            <div class="mo-flow">
+              <span>托管：<b>{{ fmtTradeBags(aidOffer.escrow) }}</b></span>
+              <span>→</span>
+              <span class="loot">回赠：<b>{{ fmtTradeBags(aidOffer.cargo) }}</b></span>
+            </div>
+          </div>
+          <p class="dim" style="margin:10px 0 4px">选择押运队员（1-3 人，须在堡且存活、无未结病例）：</p>
+          <div class="exp-member-pick">
+            <div v-for="r in inBunkerAlive" :key="r.id" class="exp-member"
+                 :class="{ selected: aidEscorts.includes(r.id), disabled: r.case_status || r.id === aidMedicId }"
+                 @click="!r.case_status && r.id !== aidMedicId && toggleAidEscort(r.id)">
+              <span class="p-avatar">{{ r.name[0] }}</span>
+              <span>{{ r.name }}</span>
+              <span class="dim">{{ r.job_zh }}<template v-if="r.case_status"> · 病例中</template></span>
+            </div>
+            <div v-if="!inBunkerAlive.length" class="dim">没有可派出的在堡居民</div>
+          </div>
+          <p class="dim" style="margin:10px 0 4px">指定医护负责人（留堡主持防疫、会签协议，不可随队）：</p>
+          <div class="exp-member-pick">
+            <div v-for="r in aidMedics()" :key="r.id" class="exp-member"
+                 :class="{ selected: aidMedicId === r.id, disabled: aidEscorts.includes(r.id) }"
+                 @click="!aidEscorts.includes(r.id) && (aidMedicId = r.id)">
+              <span class="p-avatar">{{ r.name[0] }}</span>
+              <span>{{ r.name }}</span>
+              <span class="dim">{{ r.job_zh }} · 健康 {{ fmt(r.health) }}</span>
+            </div>
+            <div v-if="!aidMedics().length" class="dim">没有可担任负责人的在堡当值医护</div>
+          </div>
+          <div class="choices">
+            <button class="choice primary-choice" :disabled="loading || !aidEscorts.length || !aidMedicId" @click="submitAid">
+              <strong>{{ loading ? '签约中…' : '管理者签约并冻结托管' }}</strong>
+            </button>
+            <button class="choice" @click="aidOffer=null"><strong>返回报价列表</strong></button>
           </div>
         </template>
       </div>

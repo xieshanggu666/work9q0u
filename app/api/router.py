@@ -28,6 +28,9 @@ from ..schemas import (
     TradeApply,
     TradeIncidentChoice,
     TradeCancel,
+    AidPropose,
+    AidTokenAction,
+    AidIncidentChoice,
     JobAssign,
     MedicalRegister,
     MedicalAdmit,
@@ -135,6 +138,15 @@ def get_session_detail(gs, db):
         elif order.get("status") == "reviewing":
             for mid in order.get("escorts", []):
                 trade_tag[mid] = "reviewing"
+    if gs.aid_order:
+        aid = gs.aid_order
+        if aid.get("status") == "transporting":
+            for mid in aid.get("escorts", []):
+                away_ids.add(mid)
+                trade_tag[mid] = "aid_transporting"
+        elif aid.get("status") in ("proposed", "reviewing"):
+            for mid in aid.get("escorts", []):
+                trade_tag[mid] = "aid_proposed" if aid.get("status") == "proposed" else "aid_reviewing"
     # 活跃病例（登记/治疗/隔离）按居民编号映射，终态履历只保留在 medical_cases 中
     med_cases = gs.medical_cases or []
     case_map = {
@@ -180,6 +192,7 @@ def get_session_detail(gs, db):
         pending_crisis=gs.pending_crisis,
         expedition=gs.expedition,
         trade_order=gs.trade_order,
+        aid_order=gs.aid_order,
         medical_cases=med_cases,
         # 床位/医护/病例计数概览（纯派生，由引擎计算保证与口径一致）
         medical_summary=BunkerEngine(db, gs).med_summary(),
@@ -363,6 +376,65 @@ def trade_cancel(sid: int, body: TradeCancel, db: Session = Depends(get_db)):
         db, gs,
         lambda eng: eng.cancel_trade(token=body.token),
         lambda eng: eng.reconcile_stale_trade("cancel", token=body.token),
+    )
+    return get_session_detail(gs, db)
+
+
+# ---- 地堡联盟援助协议 ----
+@router.get("/sessions/{sid}/aid/market")
+def aid_market(sid: int, db: Session = Depends(get_db)):
+    """当日联盟援助报价（按天确定性轮换，只读）及签署资格。"""
+    gs = _get_session_or_404(db, sid)
+    eng = BunkerEngine(db, gs)
+    return {
+        "day": gs.day,
+        "reputation": gs.reputation if gs.reputation is not None else 50,
+        "eligible": eng.aid_eligible(),
+        "offers": eng.aid_market(),
+    }
+
+
+@router.post("/sessions/{sid}/aid/propose", response_model=SessionDetail)
+def aid_propose(sid: int, body: AidPropose, db: Session = Depends(get_db)):
+    gs = _get_session_or_404(db, sid)
+    _run_mutation(
+        db, gs,
+        lambda eng: eng.propose_aid(body.offer_id, body.escort_ids, body.medic_id),
+    )
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/aid/cosign", response_model=SessionDetail)
+def aid_cosign(sid: int, body: AidTokenAction, db: Session = Depends(get_db)):
+    gs = _get_session_or_404(db, sid)
+    _run_decision(
+        db, gs,
+        lambda eng: eng.cosign_aid(token=body.token),
+        lambda eng: eng.reconcile_stale_aid("cosign", token=body.token),
+    )
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/aid/resolve", response_model=SessionDetail)
+def aid_resolve(sid: int, body: AidIncidentChoice, db: Session = Depends(get_db)):
+    gs = _get_session_or_404(db, sid)
+    _run_decision(
+        db, gs,
+        lambda eng: eng.resolve_aid_incident(body.choice_key, token=body.token),
+        lambda eng: eng.reconcile_stale_aid(
+            "incident", token=body.token, choice_key=body.choice_key
+        ),
+    )
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/aid/cancel", response_model=SessionDetail)
+def aid_cancel(sid: int, body: AidTokenAction, db: Session = Depends(get_db)):
+    gs = _get_session_or_404(db, sid)
+    _run_decision(
+        db, gs,
+        lambda eng: eng.cancel_aid(token=body.token),
+        lambda eng: eng.reconcile_stale_aid("cancel", token=body.token),
     )
     return get_session_detail(gs, db)
 

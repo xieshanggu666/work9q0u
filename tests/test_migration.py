@@ -319,6 +319,118 @@ def test_trade_incident_with_dangling_target_is_dropped(db):
     assert order["pending_incident"] is None
 
 
+# ---- 联盟援助协议快照归一化 ----
+
+def _write_aid(sid, order):
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE game_sessions SET aid_order = :o WHERE id = :sid"),
+            {"o": json.dumps(order, ensure_ascii=False), "sid": sid},
+        )
+
+
+def test_aid_backfills_new_columns(db):
+    """缺列旧表经 ensure_schema 后补齐 aid_order/last_aid。"""
+    gs = make_session(db)
+    db.commit()
+    db.expire_all()
+    db.execute(text("ALTER TABLE game_sessions RENAME TO gs_old"))
+    db.execute(text(
+        "CREATE TABLE game_sessions ("
+        "id INTEGER PRIMARY KEY, name VARCHAR(64), day INTEGER, target_day INTEGER, "
+        "status VARCHAR(16), resources JSON, survivors INTEGER, outcome JSON, "
+        "score INTEGER, created_at DATETIME, updated_at DATETIME)"
+    ))
+    db.execute(text(
+        "INSERT INTO game_sessions SELECT id,name,day,target_day,status,resources,"
+        "survivors,outcome,score,created_at,updated_at FROM gs_old"
+    ))
+    db.execute(text("DROP TABLE gs_old"))
+    db.commit()
+
+    ensure_schema(engine)
+    db.expire_all()
+    row = db.query(GameSession).first()
+    assert row.aid_order is None
+    assert row.last_aid is None
+
+
+def test_ended_save_clears_aid_order(db):
+    """已结束档案残留在途援助协议：清空，统一收敛到 ended。"""
+    gs = make_session(db)
+    gs.status = "over"
+    db.commit()
+    sid = gs.id
+    _write_aid(sid, {
+        "status": "transporting", "token": "a1", "escorts": [1],
+        "eta": 3, "travel_days": 1,
+    })
+    reconcile_old_saves(engine)
+    db.expire_all()
+    assert db.get(GameSession, sid).aid_order is None
+
+
+def test_aid_order_with_all_dangling_escorts_cleared(db):
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    _write_aid(sid, {
+        "status": "transporting", "token": "a1",
+        "escorts": [424242, 525252], "eta": 3, "travel_days": 1,
+    })
+    reconcile_old_saves(engine)
+    db.expire_all()
+    assert db.get(GameSession, sid).aid_order is None
+
+
+def test_aid_order_prunes_escorts_and_dangling_medic(db):
+    """悬空押运编号被剔除、悬空医护负责人编号被摘除，协议保留。"""
+    gs = make_session(db)
+    valid = gs.residents[0].id
+    db.commit()
+    sid = gs.id
+    _write_aid(sid, {
+        "status": "reviewing", "token": "a1",
+        "escorts": [valid, 999999], "medic_id": 888888,
+        "eta": 3, "travel_days": 0, "pending_incident": None,
+    })
+    reconcile_old_saves(engine)
+    db.expire_all()
+    order = db.get(GameSession, sid).aid_order
+    assert order is not None
+    assert order["escorts"] == [valid]
+    assert order["medic_id"] is None
+
+
+def test_settled_aid_order_snapshot_cleared(db):
+    """已收敛终态（含 rejected/cancelled/delivered/failed）残留：清空。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    for st in ("delivered", "failed", "rejected", "cancelled"):
+        _write_aid(sid, {"status": st, "token": "a", "escorts": [gs.residents[0].id]})
+        reconcile_old_saves(engine)
+        db.expire_all()
+        assert db.get(GameSession, sid).aid_order is None
+
+
+def test_valid_proposed_aid_order_left_untouched(db):
+    """结构完整的待会签协议（含医护负责人）：归一化零改写。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    order = {
+        "status": "proposed", "token": "a1",
+        "escorts": [gs.residents[1].id], "medic_id": gs.residents[0].id,
+        "eta": 2, "escrow": {"food": 20}, "cargo": {"power": 15},
+        "cargo_ratio": 1.0, "travel_days": 0, "pending_incident": None,
+    }
+    _write_aid(sid, order)
+    assert reconcile_old_saves(engine) == 0
+    db.expire_all()
+    assert db.get(GameSession, sid).aid_order["token"] == "a1"
+
+
 # ---- 医疗病例簿归一化 ----
 
 def _write_medical(sid, cases):

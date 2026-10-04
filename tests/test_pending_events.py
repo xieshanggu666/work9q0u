@@ -14,10 +14,12 @@ from app.services.engine import (
     CRISIS_POOL,
     EXPEDITION_ENCOUNTERS,
     TRADE_INCIDENTS,
+    AID_INCIDENTS,
     TRADE_TRANSPORTING,
     PENDING_CRISIS,
     PENDING_ENCOUNTER,
     PENDING_INCIDENT,
+    PENDING_AID_INCIDENT,
     _PENDING_SLOTS,
     FOOD,
     WATER,
@@ -65,24 +67,27 @@ def test_snapshots_share_one_structure(db):
     crisis = eng._build_crisis(CRISIS_POOL[0])
     encounter = eng._build_expedition_encounter(EXPEDITION_ENCOUNTERS[0], {})
     incident = eng._build_trade_incident(TRADE_INCIDENTS[0], {})
-    for snap in (crisis, encounter, incident):
+    aid_incident = eng._build_aid_incident(AID_INCIDENTS[0], {})
+    for snap in (crisis, encounter, incident, aid_incident):
         assert SNAPSHOT_KEYS <= set(snap.keys())
         assert snap["day"] == gs.day
         assert snap["token"]
     # 一次性 token 互不相同
-    tokens = {crisis["token"], encounter["token"], incident["token"]}
-    assert len(tokens) == 3
+    tokens = {crisis["token"], encounter["token"], incident["token"], aid_incident["token"]}
+    assert len(tokens) == 4
 
 
 def test_slot_registry_covers_all_kinds(db):
-    """槽位注册表完整声明三类待决事件：持久化字段、凭据列与互斥阶段。"""
-    assert set(_PENDING_SLOTS) == {PENDING_CRISIS, PENDING_ENCOUNTER, PENDING_INCIDENT}
+    """槽位注册表完整声明四类待决事件：持久化字段、凭据列与互斥阶段。"""
+    assert set(_PENDING_SLOTS) == {
+        PENDING_CRISIS, PENDING_ENCOUNTER, PENDING_INCIDENT, PENDING_AID_INCIDENT
+    }
     fields = {s["field"] for s in _PENDING_SLOTS.values()}
     creds = {s["credential_attr"] for s in _PENDING_SLOTS.values()}
     phases = {s["phase"] for s in _PENDING_SLOTS.values()}
     assert fields == {"pending_crisis", "pending_encounter", "pending_incident"}
-    assert creds == {"last_resolution", "last_expedition", "last_trade"}
-    assert phases == {"crisis", "expedition", "trade"}
+    assert creds == {"last_resolution", "last_expedition", "last_trade", "last_aid"}
+    assert phases == {"crisis", "expedition", "trade", "aid"}
 
 
 # ---- 持久化与恢复：三类快照落库后重开档案恢复同一场抉择 ----
@@ -257,7 +262,7 @@ def test_old_save_pending_snapshots_recover_and_resolve(db):
 
 
 def test_reconcile_409_is_uniform_across_kinds(db):
-    """三类核对入口对完全陌生的凭据统一抛 409（并发重复结算的兜底）。"""
+    """四类核对入口对完全陌生的凭据统一抛 409（并发重复结算的兜底）。"""
     gs = make_session(db)
     eng = BunkerEngine(db, gs, rand=FixedRand())
     with pytest.raises(BunkerEngineConflict):
@@ -266,12 +271,14 @@ def test_reconcile_409_is_uniform_across_kinds(db):
         eng.reconcile_stale_expedition("encounter", token="x", choice_key="a")
     with pytest.raises(BunkerEngineConflict):
         eng.reconcile_stale_trade("incident", token="x", choice_key="a")
+    with pytest.raises(BunkerEngineConflict):
+        eng.reconcile_stale_aid("incident", token="x", choice_key="a")
 
 
 # ---- 终局收敛：一次清算全部待决槽位 ----
 
 def test_finish_clears_all_pending_slots(db):
-    """终局收敛：危机/探索队/贸易订单三类快照一次性清空，阶段统一 ended。"""
+    """终局收敛：危机/探索队/贸易订单/援助协议四类快照一次性清空，阶段统一 ended。"""
     gs = make_session(db)
     eng = BunkerEngine(db, gs, rand=FixedRand())
     gs.pending_crisis = {"token": "c", "event": "mutiny", "choices": []}
@@ -283,10 +290,15 @@ def test_finish_clears_all_pending_slots(db):
         "token": "o", "status": TRADE_TRANSPORTING, "escorts": [gs.residents[1].id],
         "pending_incident": {"token": "i", "event": "ambush"},
     }
+    gs.aid_order = {
+        "token": "a", "status": "transporting", "escorts": [gs.residents[2].id],
+        "pending_incident": {"token": "ai", "event": "plague_contact"},
+    }
     eng._finish(win=True, reason="测试终局")
     assert gs.pending_crisis is None
     assert gs.expedition is None
     assert gs.trade_order is None
+    assert gs.aid_order is None
     assert eng.current_pending_event() == (None, None)
     assert eng.phase == "ended"
 
